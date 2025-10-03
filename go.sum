@@ -1,6 +1,8 @@
 github.com/BurntSushi/toml v0.3.1/go.mod h1:xHWCNGjB5oqiDr8zfno3MHue2Ht5sIBksp03qcyfWMU=
 github.com/Masterminds/semver/v3 v3.1.1/go.mod h1:VPu/7SZ7ePZ3QOrcuXROw5FAcLl4a0cBrbBpGY/8hQs=
 github.com/ReneKroon/ttlcache v1.6.0/go.mod h1:DG6nbhXKUQhrExfwwLuZUdH7UnRDDRA1IW+nBuCssvs=
+github.com/TicketsBot-cloud/archiverclient v0.0.0-20250514201416-cf23f65eb3fc h1:2EFgb6gQMedsO7YkqUPH1zY8+L6i3sGuV/YAv0gPqhQ=
+github.com/TicketsBot-cloud/archiverclient v0.0.0-20250514201416-cf23f65eb3fc/go.mod h1:Mux1bEPpOHwRw1wo6Fa6qJLJH9Erk9qv1yAIfLi1Wmw=
 github.com/TicketsBot-cloud/common v0.0.0-20250208132851-d5083bb04d98 h1:HwtXrqSv6y5E8mTnkOtISTaQr6dsK/lfUC8tUA6SzSU=
 github.com/TicketsBot-cloud/common v0.0.0-20250208132851-d5083bb04d98/go.mod h1:iiZhl7w5DeTEGzAeq/hzani8+ILQz60g4JFkOy2vkuM=
 github.com/TicketsBot-cloud/database v0.0.0-20250918212912-4cc263bc1b41 h1:X+V7IZtmDbE9h5cGSKnhCuisBFZ14Suzsdjnk8UUN3A=
