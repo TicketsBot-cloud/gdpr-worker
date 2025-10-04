@@ -9,6 +9,7 @@ import (
 	"github.com/TicketsBot-cloud/gdl/objects/interaction/component"
 	"github.com/TicketsBot-cloud/gdl/rest"
 	"github.com/TicketsBot-cloud/gdl/rest/ratelimit"
+	"github.com/TicketsBot-cloud/gdpr-worker/internal/config"
 	"github.com/TicketsBot-cloud/gdpr-worker/internal/utils"
 	"github.com/TicketsBot-cloud/gdpr-worker/internal/gdprrelay"
 	"go.uber.org/zap"
@@ -47,11 +48,13 @@ func (c *Callback) SendCompletion(ctx context.Context, request gdprrelay.GDPRReq
 
 	if err := c.editOriginalMessage(ctx, request, components); err != nil {
 		if c.isTokenExpired(err) {
-			c.logger.Warn("Interaction token expired, cannot send completion callback",
-				zap.Uint64("user_id", request.UserId),
-				zap.Int("request_type", int(request.Type)),
-				zap.Error(err),
-			)
+			if dmErr := c.sendCompletionViaDM(ctx, request, result); dmErr != nil {
+				c.logger.Error("Failed to send completion via DM",
+					zap.Error(dmErr),
+					zap.Uint64("user_id", request.UserId),
+				)
+				return dmErr
+			}
 			return nil
 		}
 
@@ -64,9 +67,6 @@ func (c *Callback) SendCompletion(ctx context.Context, request gdprrelay.GDPRReq
 
 	if err := c.sendEphemeralFollowup(ctx, request, result); err != nil {
 		if c.isTokenExpired(err) {
-			c.logger.Warn("Interaction token expired for follow-up message",
-				zap.Uint64("user_id", request.UserId),
-			)
 			return nil
 		}
 
@@ -75,11 +75,6 @@ func (c *Callback) SendCompletion(ctx context.Context, request gdprrelay.GDPRReq
 			zap.Uint64("user_id", request.UserId),
 		)
 	}
-
-	c.logger.Info("Sent completion callbacks",
-		zap.Uint64("user_id", request.UserId),
-		zap.Int("request_type", int(request.Type)),
-	)
 
 	return nil
 }
@@ -93,7 +88,8 @@ func (c *Callback) isTokenExpired(err error) bool {
 	return strings.Contains(errStr, "unknown webhook") ||
 		strings.Contains(errStr, "unknown interaction") ||
 		strings.Contains(errStr, "invalid webhook token") ||
-		strings.Contains(errStr, "interaction has already been acknowledged")
+		strings.Contains(errStr, "interaction has already been acknowledged") ||
+		strings.Contains(errStr, "context deadline exceeded")
 }
 
 func (c *Callback) buildResultMessage(result ResultData) string {
@@ -226,4 +222,41 @@ func (c *Callback) sendEphemeralFollowup(ctx context.Context, request gdprrelay.
 
 	_, err := rest.CreateFollowupMessage(ctx, request.InteractionToken, c.rateLimiter, request.ApplicationId, data)
 	return err
+}
+
+func (c *Callback) sendCompletionViaDM(ctx context.Context, request gdprrelay.GDPRRequest, result ResultData) error {
+	if config.Conf.Discord.Token == "" {
+		c.logger.Error("Discord token not configured, cannot send DM",
+			zap.Uint64("user_id", request.UserId),
+		)
+		return fmt.Errorf("discord token not configured")
+	}
+
+	dmChannel, err := rest.CreateDM(ctx, config.Conf.Discord.Token, c.rateLimiter, request.UserId)
+	if err != nil {
+		c.logger.Error("Failed to create DM channel",
+			zap.Error(err),
+			zap.Uint64("user_id", request.UserId),
+		)
+		return fmt.Errorf("failed to create DM channel: %w", err)
+	}
+
+	components := c.buildResultComponents(result)
+
+	data := rest.CreateMessageData{
+		Components: components,
+		Flags:      uint(message.FlagComponentsV2),
+	}
+
+	_, err = rest.CreateMessage(ctx, config.Conf.Discord.Token, c.rateLimiter, dmChannel.Id, data)
+	if err != nil {
+		c.logger.Error("Failed to send DM message",
+			zap.Error(err),
+			zap.Uint64("user_id", request.UserId),
+			zap.Uint64("channel_id", dmChannel.Id),
+		)
+		return fmt.Errorf("failed to send DM message: %w", err)
+	}
+
+	return nil
 }

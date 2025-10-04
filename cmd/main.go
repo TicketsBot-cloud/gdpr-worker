@@ -73,29 +73,23 @@ func main() {
 	ch := make(chan gdprrelay.GDPRRequest)
 	go gdprrelay.Listen(redisClient, ch, logger.With(zap.String("service", "gdprrelay")))
 
-	// Semaphore to limit concurrent request processing
 	semaphore := make(chan struct{}, config.Conf.MaxConcurrency)
 
 	go func() {
 		for request := range ch {
-			// Acquire semaphore slot (blocks if at max concurrency)
 			semaphore <- struct{}{}
 
 			go func(req gdprrelay.GDPRRequest) {
 				defer func() {
-					// Release semaphore slot when done
 					<-semaphore
 				}()
-
-				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
-				defer cancel()
 
 				logger.Info("Processing GDPR request",
 					zap.Int("type", int(req.Type)),
 					zap.Uint64("user_id", req.UserId),
 				)
 
-				result := proc.Process(ctx, req)
+				result := proc.Process(context.Background(), req)
 
 				if result.Error != nil {
 					logger.Error("Failed to process GDPR request",
@@ -114,7 +108,10 @@ func main() {
 					TicketIds:       req.TicketIds,
 				}
 
-				if err := callbackHandler.SendCompletion(ctx, req, callbackData); err != nil {
+				callbackCtx, callbackCancel := context.WithTimeout(context.Background(), 30*time.Second)
+				defer callbackCancel()
+
+				if err := callbackHandler.SendCompletion(callbackCtx, req, callbackData); err != nil {
 					logger.Error("Failed to send completion callback",
 						zap.Error(err),
 						zap.Uint64("user_id", req.UserId),
