@@ -180,8 +180,6 @@ func (c *Callback) buildResultComponents(result ResultData) []component.Componen
 	colour := utils.Green
 	if result.Error != nil {
 		colour = utils.Red
-	} else if result.TotalDeleted == 0 && result.MessagesDeleted == 0 {
-		colour = utils.Orange
 	}
 
 	innerComponents := []component.Component{

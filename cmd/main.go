@@ -84,12 +84,14 @@ func main() {
 					<-semaphore
 				}()
 
+				processCtx := context.Background()
+
 				logger.Info("Processing GDPR request",
 					zap.Int("type", int(req.Type)),
 					zap.Uint64("user_id", req.UserId),
 				)
 
-				result := proc.Process(context.Background(), req)
+				result := proc.Process(processCtx, req)
 
 				if result.Error != nil {
 					logger.Error("Failed to process GDPR request",
@@ -97,6 +99,20 @@ func main() {
 						zap.Uint64("user_id", req.UserId),
 						zap.Error(result.Error),
 					)
+
+					if rejectErr := gdprrelay.Reject(processCtx, redisClient, req, logger); rejectErr != nil {
+						logger.Error("Failed to reject GDPR request",
+							zap.Error(rejectErr),
+							zap.Uint64("user_id", req.UserId),
+						)
+					}
+				} else {
+					if ackErr := gdprrelay.Acknowledge(processCtx, redisClient, req, logger); ackErr != nil {
+						logger.Error("Failed to acknowledge GDPR request",
+							zap.Error(ackErr),
+							zap.Uint64("user_id", req.UserId),
+						)
+					}
 				}
 
 				callbackData := callback.ResultData{

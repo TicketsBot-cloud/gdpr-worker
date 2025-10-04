@@ -123,11 +123,6 @@ func (p *Processor) processAllTranscripts(ctx context.Context, request gdprrelay
 			continue
 		}
 		totalDeleted += deleted
-		p.logger.Info("Deleted all transcripts",
-			zap.Uint64("guild_id", guildId),
-			zap.Uint64("user_id", request.UserId),
-			zap.Int("count", deleted),
-		)
 	}
 
 	if totalDeleted > 0 {
