@@ -106,10 +106,6 @@ func Acknowledge(ctx context.Context, redisClient *redis.Client, request GDPRReq
 			if err != nil {
 				return fmt.Errorf("failed to remove from processing queue: %w", err)
 			}
-
-			logger.Info("Acknowledged GDPR request",
-				zap.String("request_id", queued.RequestID),
-			)
 			return nil
 		}
 	}
