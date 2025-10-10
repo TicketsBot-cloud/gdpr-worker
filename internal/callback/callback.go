@@ -12,6 +12,7 @@ import (
 	"github.com/TicketsBot-cloud/gdpr-worker/internal/config"
 	"github.com/TicketsBot-cloud/gdpr-worker/internal/utils"
 	"github.com/TicketsBot-cloud/gdpr-worker/internal/gdprrelay"
+	"github.com/TicketsBot-cloud/gdpr-worker/i18n"
 	"go.uber.org/zap"
 )
 
@@ -44,11 +45,12 @@ func (c *Callback) SendCompletion(ctx context.Context, request gdprrelay.GDPRReq
 		return nil
 	}
 
-	components := c.buildResultComponents(result)
+	locale := i18n.GetLocale(request.Language)
+	components := c.buildResultComponents(locale, result)
 
 	if err := c.editOriginalMessage(ctx, request, components); err != nil {
 		if c.isTokenExpired(err) {
-			if dmErr := c.sendCompletionViaDM(ctx, request, result); dmErr != nil {
+			if dmErr := c.sendCompletionViaDM(ctx, request, locale, result); dmErr != nil {
 				c.logger.Error("Failed to send completion via DM",
 					zap.Error(dmErr),
 					zap.Uint64("user_id", request.UserId),
@@ -65,7 +67,7 @@ func (c *Callback) SendCompletion(ctx context.Context, request gdprrelay.GDPRReq
 		return err
 	}
 
-	if err := c.sendEphemeralFollowup(ctx, request, result); err != nil {
+	if err := c.sendEphemeralFollowup(ctx, request, locale, result); err != nil {
 		if c.isTokenExpired(err) {
 			return nil
 		}
@@ -92,91 +94,49 @@ func (c *Callback) isTokenExpired(err error) bool {
 		strings.Contains(errStr, "context deadline exceeded")
 }
 
-func (c *Callback) buildResultMessage(result ResultData) string {
+func (c *Callback) buildResultMessage(locale *i18n.Locale, result ResultData) string {
 	var content string
 
 	switch result.RequestType {
 	case gdprrelay.RequestTypeAllTranscripts:
-		if len(result.GuildIds) == 1 {
-			if result.TotalDeleted == 0 {
-				content = fmt.Sprintf(
-					"**Request Type:** Delete all transcripts from server\n"+
-						"**Result:** No transcripts found",
-				)
-			} else {
-				content = fmt.Sprintf(
-					"**Request Type:** Delete all transcripts from server\n"+
-						"**Transcripts Deleted:** %d",
-					result.TotalDeleted,
-				)
-			}
+		if result.TotalDeleted == 0 {
+			content = i18n.GetMessage(locale, i18n.GdprCompletedNoData)
+		} else if len(result.GuildIds) == 1 {
+			content = i18n.GetMessage(locale, i18n.GdprCompletedAllTranscripts, result.TotalDeleted)
 		} else {
-			if result.TotalDeleted == 0 {
-				content = fmt.Sprintf(
-					"**Request Type:** Delete all transcripts from servers\n"+
-						"**Servers:** %d\n"+
-						"**Result:** No transcripts found",
-					len(result.GuildIds),
-				)
-			} else {
-				content = fmt.Sprintf(
-					"**Request Type:** Delete all transcripts from servers\n"+
-						"**Servers:** %d\n"+
-						"**Transcripts Deleted:** %d",
-					len(result.GuildIds), result.TotalDeleted,
-				)
-			}
+			content = i18n.GetMessage(locale, i18n.GdprCompletedAllTranscriptsMulti, len(result.GuildIds), result.TotalDeleted)
 		}
 
 	case gdprrelay.RequestTypeSpecificTranscripts:
 		if result.TotalDeleted == 0 {
-			content = fmt.Sprintf(
-				"**Request Type:** Delete specific transcripts\n"+
-					"**Result:** No transcripts found (they may have already been deleted)",
-			)
+			content = i18n.GetMessage(locale, i18n.GdprCompletedNoData)
 		} else {
-			content = fmt.Sprintf(
-				"**Request Type:** Delete specific transcripts\n"+
-					"**Transcripts Deleted:** %d",
-				result.TotalDeleted,
-			)
+			content = i18n.GetMessage(locale, i18n.GdprCompletedSpecificTranscripts, result.TotalDeleted)
 		}
 
 	case gdprrelay.RequestTypeAllMessages:
 		if result.MessagesDeleted == 0 {
-			content = "**Request Type:** Delete all messages from your account\n" +
-				"**Result:** No messages found in closed tickets"
+			content = i18n.GetMessage(locale, i18n.GdprCompletedNoData)
 		} else {
-			content = fmt.Sprintf(
-				"**Request Type:** Delete all messages from your account\n"+
-					"**Messages Anonymized:** %d\n",
-				result.MessagesDeleted,
-			)
+			content = i18n.GetMessage(locale, i18n.GdprCompletedAllMessages, result.MessagesDeleted)
 		}
 
 	case gdprrelay.RequestTypeSpecificMessages:
 		if result.MessagesDeleted == 0 {
-			content = fmt.Sprintf(
-				"**Request Type:** Delete messages in specific tickets\n"+
-					"**Result:** No messages found (tickets may not exist or have no messages from you)",
-			)
+			content = i18n.GetMessage(locale, i18n.GdprCompletedNoData)
 		} else {
-			content = fmt.Sprintf(
-				"**Request Type:** Delete messages in specific tickets\n"+
-					"**Messages Anonymized:** %d\n",
-				result.MessagesDeleted,
-			)
+			content = i18n.GetMessage(locale, i18n.GdprCompletedSpecificMessages, result.MessagesDeleted)
 		}
 	}
 
 	if result.Error != nil {
-		content += fmt.Sprintf("\n\n**⚠️ Error:** %s", result.Error.Error())
+		content = i18n.GetMessage(locale, i18n.GdprCompletedError, result.Error.Error())
 	}
 
 	return content
 }
 
-func (c *Callback) buildResultComponents(result ResultData) []component.Component {
+func (c *Callback) buildResultComponents(locale *i18n.Locale, result ResultData) []component.Component {
 	colour := utils.Green
 	if result.Error != nil {
 		colour = utils.Red
@@ -184,11 +144,12 @@ func (c *Callback) buildResultComponents(result ResultData) []component.Componen
 
 	innerComponents := []component.Component{
 		component.BuildTextDisplay(component.TextDisplay{
-			Content: c.buildResultMessage(result),
+			Content: c.buildResultMessage(locale, result),
 		}),
 	}
 
-	container := utils.BuildContainerWithComponents(colour, "GDPR Request Completed", innerComponents)
+	title := i18n.GetMessage(locale, i18n.GdprCompletedTitle)
+	container := utils.BuildContainerWithComponents(colour, title, innerComponents)
 	return []component.Component{container}
 }
 
@@ -202,15 +163,15 @@ func (c *Callback) editOriginalMessage(ctx context.Context, request gdprrelay.GD
 	return err
 }
 
-func (c *Callback) sendEphemeralFollowup(ctx context.Context, request gdprrelay.GDPRRequest, result ResultData) error {
+func (c *Callback) sendEphemeralFollowup(ctx context.Context, request gdprrelay.GDPRRequest, locale *i18n.Locale, result ResultData) error {
 	var content string
 
 	if result.Error != nil {
-		content = fmt.Sprintf("⚠️ Your GDPR request encountered an error: %s", result.Error.Error())
+		content = i18n.GetMessage(locale, i18n.GdprFollowupError, result.Error.Error())
 	} else if result.TotalDeleted == 0 && result.MessagesDeleted == 0 {
-		content = "ℹ️ Your GDPR request has been processed. No data was found to delete."
+		content = i18n.GetMessage(locale, i18n.GdprFollowupNoData)
 	} else {
-		content = "✅ Your GDPR request has been processed successfully."
+		content = i18n.GetMessage(locale, i18n.GdprFollowupSuccess)
 	}
 
 	data := rest.WebhookBody{
@@ -222,7 +183,7 @@ func (c *Callback) sendEphemeralFollowup(ctx context.Context, request gdprrelay.
 	return err
 }
 
-func (c *Callback) sendCompletionViaDM(ctx context.Context, request gdprrelay.GDPRRequest, result ResultData) error {
+func (c *Callback) sendCompletionViaDM(ctx context.Context, request gdprrelay.GDPRRequest, locale *i18n.Locale, result ResultData) error {
 	if config.Conf.Discord.Token == "" {
 		c.logger.Error("Discord token not configured, cannot send DM",
 			zap.Uint64("user_id", request.UserId),
@@ -239,7 +200,7 @@ func (c *Callback) sendCompletionViaDM(ctx context.Context, request gdprrelay.GD
 		return fmt.Errorf("failed to create DM channel: %w", err)
 	}
 
-	components := c.buildResultComponents(result)
+	components := c.buildResultComponents(locale, result)
 
 	data := rest.CreateMessageData{
 		Components: components,

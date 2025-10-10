@@ -26,6 +26,7 @@ FROM ubuntu:latest
 RUN apt-get update && apt-get upgrade -y && apt-get install -y ca-certificates curl
 
 COPY --from=builder /go/src/github.com/TicketsBot-cloud/gdpr-worker/main /srv/gdpr-worker/main
+COPY --from=builder /go/src/github.com/TicketsBot-cloud/gdpr-worker/locale /srv/gdpr-worker/locale
 
 RUN chmod +x /srv/gdpr-worker/main
 

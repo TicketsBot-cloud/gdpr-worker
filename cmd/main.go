@@ -8,6 +8,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/TicketsBot-cloud/gdpr-worker/i18n"
 	"github.com/TicketsBot-cloud/gdpr-worker/internal/archiver"
 	"github.com/TicketsBot-cloud/gdpr-worker/internal/callback"
 	"github.com/TicketsBot-cloud/gdpr-worker/internal/config"
@@ -26,6 +27,12 @@ func main() {
 
 	logger := initLogger(config.Conf.JsonLogs, config.Conf.LogLevel)
 	logger.Info("Starting GDPR Worker")
+
+	logger.Info("Initializing i18n")
+	if err := i18n.Init("locale"); err != nil {
+		logger.Fatal("Failed to initialize i18n", zap.Error(err))
+		return
+	}
 
 	logger.Info("Connecting to Redis")
 	redisClient := redis.NewClient(&redis.Options{
