@@ -117,8 +117,10 @@ func (c *Callback) buildResultMessage(locale *i18n.Locale, result ResultData) st
 	case gdprrelay.RequestTypeAllMessages:
 		if result.MessagesDeleted == 0 {
 			content = i18n.GetMessage(locale, i18n.GdprCompletedNoData)
-		} else {
+		} else if len(result.GuildIds) == 1 {
 			content = i18n.GetMessage(locale, i18n.GdprCompletedAllMessages, result.MessagesDeleted)
+		} else {
+			content = i18n.GetMessage(locale, i18n.GdprCompletedAllMessagesMulti, len(result.GuildIds), result.MessagesDeleted)
 		}
 
 	case gdprrelay.RequestTypeSpecificMessages:

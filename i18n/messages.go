@@ -8,6 +8,7 @@ var (
 	GdprCompletedAllTranscriptsMulti MessageId = "gdpr.completed.all_transcripts_multi"
 	GdprCompletedSpecificTranscripts MessageId = "gdpr.completed.specific_transcripts"
 	GdprCompletedAllMessages         MessageId = "gdpr.completed.all_messages"
+	GdprCompletedAllMessagesMulti    MessageId = "gdpr.completed.all_messages_multi"
 	GdprCompletedSpecificMessages    MessageId = "gdpr.completed.specific_messages"
 	GdprCompletedNoData              MessageId = "gdpr.completed.no_data"
 	GdprCompletedError               MessageId = "gdpr.completed.error"
