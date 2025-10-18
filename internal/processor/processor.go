@@ -180,7 +180,10 @@ func (p *Processor) processSpecificTranscripts(ctx context.Context, request gdpr
 }
 
 func (p *Processor) processAllMessages(ctx context.Context, request gdprrelay.GDPRRequest) ProcessResult {
-	messagesDeleted, err := p.deleteAllUserMessages(ctx, request.UserId)
+	var messagesDeleted int
+	var err error
+
+	messagesDeleted, err = p.deleteUserMessagesFromGuilds(ctx, request.GuildIds, request.UserId)
 	if err != nil {
 		return ProcessResult{Error: fmt.Errorf("failed to delete all user messages: %w", err)}
 	}
@@ -188,6 +191,7 @@ func (p *Processor) processAllMessages(ctx context.Context, request gdprrelay.GD
 	p.logger.Info("GDPR request completed",
 		zap.String("type", "all_messages"),
 		zap.Uint64("user_id", request.UserId),
+		zap.Uint64s("guild_ids", request.GuildIds),
 		zap.Int("messages_deleted", messagesDeleted),
 	)
 
@@ -304,8 +308,8 @@ type ticketInfo struct {
 	GuildID uint64
 }
 
-func (p *Processor) deleteAllUserMessages(ctx context.Context, userId uint64) (messagesDeleted int, err error) {
-	tickets, err := p.getUserTickets(ctx, userId)
+func (p *Processor) deleteUserMessagesFromGuilds(ctx context.Context, guildIds []uint64, userId uint64) (messagesDeleted int, err error) {
+	tickets, err := p.getUserTicketsInGuilds(ctx, userId, guildIds)
 	if err != nil {
 		return 0, err
 	}
@@ -341,6 +345,35 @@ func (p *Processor) getUserTickets(ctx context.Context, userId uint64) ([]ticket
 	rows, err := database.Client.Tickets.Query(ctx, query, userId)
 	if err != nil {
 		return nil, fmt.Errorf("failed to query user tickets: %w", err)
+	}
+	defer rows.Close()
+
+	var tickets []ticketInfo
+	for rows.Next() {
+		var ticket ticketInfo
+		if err := rows.Scan(&ticket.ID, &ticket.GuildID); err == nil {
+			tickets = append(tickets, ticket)
+		}
+	}
+
+	return tickets, nil
+}
+
+func (p *Processor) getUserTicketsInGuilds(ctx context.Context, userId uint64, guildIds []uint64) ([]ticketInfo, error) {
+	query := `
+	SELECT DISTINCT t.id, t.guild_id
+	FROM tickets t
+	LEFT JOIN ticket_members tm ON t.guild_id = tm.guild_id AND t.id = tm.ticket_id
+	WHERE (tm.user_id = $1 OR t.user_id = $1)
+	AND t.guild_id = ANY($2)
+	AND t.open = false
+	AND t.has_transcript = true
+	ORDER BY t.id
+	`
+
+	rows, err := database.Client.Tickets.Query(ctx, query, userId, guildIds)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query user tickets in guilds: %w", err)
 	}
 	defer rows.Close()
 
