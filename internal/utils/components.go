@@ -47,7 +47,7 @@ func BuildContainerWithComponents(colour Colour, title string, innerComponents [
 
 func FormatGuildDisplay(guildId uint64, guildNames map[uint64]string) string {
 	if name, ok := guildNames[guildId]; ok && name != "" {
-		return name + " (ID: " + strconv.FormatUint(guildId, 10) + ")"
+		return name + " (" + strconv.FormatUint(guildId, 10) + ")"
 	}
-	return "ID: " + strconv.FormatUint(guildId, 10)
+	return strconv.FormatUint(guildId, 10)
 }
