@@ -36,7 +36,7 @@ type QueuedRequest struct {
 	QueuedAt      time.Time   `json:"queued_at"`
 	RetryCount    int         `json:"retry_count"`
 	LastAttemptAt time.Time   `json:"last_attempt_at,omitempty"`
-	RequestID     string      `json:"request_id"`
+	RequestID     int         `json:"request_id"`
 }
 
 const (
@@ -46,7 +46,7 @@ const (
 	maxRetries    = 3
 )
 
-func Listen(redisClient *redis.Client, ch chan GDPRRequest, logger *zap.Logger) {
+func Listen(redisClient *redis.Client, ch chan QueuedRequest, logger *zap.Logger) {
 	ctx := context.Background()
 
 	if err := recoverStalledRequests(ctx, redisClient, logger); err != nil {
@@ -80,13 +80,13 @@ func Listen(redisClient *redis.Client, ch chan GDPRRequest, logger *zap.Logger) 
 		queued.LastAttemptAt = time.Now()
 
 		logger.Info("Dequeued GDPR request",
-			zap.String("request_id", queued.RequestID),
+			zap.Int("request_id", queued.RequestID),
 			zap.Int("retry_count", queued.RetryCount),
 			zap.Int("type", int(queued.Request.Type)),
 			zap.Uint64("user_id", queued.Request.UserId),
 		)
 
-		ch <- queued.Request
+		ch <- queued
 	}
 }
 
@@ -134,7 +134,7 @@ func Reject(ctx context.Context, redisClient *redis.Client, request GDPRRequest,
 			if _, removeErr := redisClient.LRem(ctx, keyProcessing, 1, item).Result(); removeErr != nil {
 				logger.Error("Failed to remove from processing queue",
 					zap.Error(removeErr),
-					zap.String("request_id", queued.RequestID),
+					zap.Int("request_id", queued.RequestID),
 				)
 				return removeErr
 			}
@@ -143,7 +143,7 @@ func Reject(ctx context.Context, redisClient *redis.Client, request GDPRRequest,
 
 			if queued.RetryCount >= maxRetries {
 				logger.Warn("GDPR request exceeded max retries",
-					zap.String("request_id", queued.RequestID),
+					zap.Int("request_id", queued.RequestID),
 					zap.Int("retry_count", queued.RetryCount),
 					zap.Error(err),
 				)
@@ -153,7 +153,7 @@ func Reject(ctx context.Context, redisClient *redis.Client, request GDPRRequest,
 			}
 
 			logger.Info("Requeuing failed GDPR request",
-				zap.String("request_id", queued.RequestID),
+				zap.Int("request_id", queued.RequestID),
 				zap.Int("retry_count", queued.RetryCount),
 				zap.Error(err),
 			)
@@ -201,7 +201,7 @@ func recoverStalledRequests(ctx context.Context, redisClient *redis.Client, logg
 		}
 
 		logger.Info("Recovering stalled request",
-			zap.String("request_id", queued.RequestID),
+			zap.Int("request_id", queued.RequestID),
 			zap.Int("retry_count", queued.RetryCount),
 		)
 
@@ -209,7 +209,7 @@ func recoverStalledRequests(ctx context.Context, redisClient *redis.Client, logg
 		if err != nil {
 			logger.Error("Failed to marshal stalled request",
 				zap.Error(err),
-				zap.String("request_id", queued.RequestID),
+				zap.Int("request_id", queued.RequestID),
 			)
 			continue
 		}
@@ -217,7 +217,7 @@ func recoverStalledRequests(ctx context.Context, redisClient *redis.Client, logg
 		if err := redisClient.LPush(ctx, keyPending, string(marshalled)).Err(); err != nil {
 			logger.Error("Failed to requeue stalled request",
 				zap.Error(err),
-				zap.String("request_id", queued.RequestID),
+				zap.Int("request_id", queued.RequestID),
 			)
 			continue
 		}

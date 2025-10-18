@@ -12,7 +12,7 @@ go 1.24.0
 
 require (
 	github.com/TicketsBot-cloud/archiverclient v0.0.0-20251015181023-f0b66a074704
-	github.com/TicketsBot-cloud/database v0.0.0-20250918212912-4cc263bc1b41
+	github.com/TicketsBot-cloud/database v0.0.0-20251018202538-7f9567e1aeab
 	github.com/TicketsBot-cloud/gdl v0.0.0-20251007163257-7e59b92d02dd
 	github.com/TicketsBot-cloud/logarchiver v0.0.0-20250809082842-70aa389bcbdf
 	github.com/caarlos0/env/v10 v10.0.0
@@ -23,7 +23,7 @@ require (
 )
 
 require (
-	github.com/TicketsBot-cloud/common v0.0.0-20250208132851-d5083bb04d98 // indirect
+	github.com/TicketsBot-cloud/common v0.0.0-20250509064208-a2d357175463 // indirect
 	github.com/TicketsBot/common v0.0.0-20241117150316-ff54c97b45c1 // indirect
 	github.com/TicketsBot/ttlcache v1.6.1-0.20200405150101-acc18e37b261 // indirect
 	github.com/caarlos0/env v3.5.0+incompatible // indirect
@@ -39,7 +39,7 @@ require (
 	github.com/jackc/pgpassfile v1.0.0 // indirect
 	github.com/jackc/pgproto3/v2 v2.3.3 // indirect
 	github.com/jackc/pgservicefile v0.0.0-20240606120523-5a60cdf6a761 // indirect
-	github.com/jackc/pgtype v1.14.0 // indirect
+	github.com/jackc/pgtype v1.14.4 // indirect
 	github.com/jackc/pgx v3.6.2+incompatible // indirect
 	github.com/jackc/pgx/v5 v5.7.6 // indirect
 	github.com/jackc/puddle v1.3.0 // indirect

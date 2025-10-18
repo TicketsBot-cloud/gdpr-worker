@@ -77,7 +77,7 @@ func main() {
 	logger.Info("Starting GDPR queue listener",
 		zap.Int("max_concurrency", config.Conf.MaxConcurrency),
 	)
-	ch := make(chan gdprrelay.GDPRRequest)
+	ch := make(chan gdprrelay.QueuedRequest)
 	go gdprrelay.Listen(redisClient, ch, logger.With(zap.String("service", "gdprrelay")))
 
 	semaphore := make(chan struct{}, config.Conf.MaxConcurrency)
@@ -86,7 +86,7 @@ func main() {
 		for request := range ch {
 			semaphore <- struct{}{}
 
-			go func(req gdprrelay.GDPRRequest) {
+			go func(req gdprrelay.QueuedRequest) {
 				defer func() {
 					<-semaphore
 				}()
@@ -94,30 +94,37 @@ func main() {
 				processCtx := context.Background()
 
 				logger.Info("Processing GDPR request",
-					zap.Int("type", int(req.Type)),
-					zap.Uint64("user_id", req.UserId),
+					zap.Int("type", int(req.Request.Type)),
+					zap.Uint64("user_id", req.Request.UserId),
 				)
 
-				result := proc.Process(processCtx, req)
+				result := proc.Process(processCtx, req.Request)
 
 				if result.Error != nil {
 					logger.Error("Failed to process GDPR request",
-						zap.Int("type", int(req.Type)),
-						zap.Uint64("user_id", req.UserId),
+						zap.Int("type", int(req.Request.Type)),
+						zap.Uint64("user_id", req.Request.UserId),
 						zap.Error(result.Error),
 					)
 
-					if rejectErr := gdprrelay.Reject(processCtx, redisClient, req, logger); rejectErr != nil {
+					if updateErr := database.Client.GdprLogs.UpdateLogStatus(req.RequestID, "Failed"); updateErr != nil {
+						logger.Error("Failed to update GDPR log",
+							zap.Error(updateErr),
+							zap.Uint64("user_id", req.Request.UserId),
+						)
+					}
+
+					if rejectErr := gdprrelay.Reject(processCtx, redisClient, req.Request, logger); rejectErr != nil {
 						logger.Error("Failed to reject GDPR request",
 							zap.Error(rejectErr),
-							zap.Uint64("user_id", req.UserId),
+							zap.Uint64("user_id", req.Request.UserId),
 						)
 					}
 				} else {
-					if ackErr := gdprrelay.Acknowledge(processCtx, redisClient, req, logger); ackErr != nil {
+					if ackErr := gdprrelay.Acknowledge(processCtx, redisClient, req.Request, logger); ackErr != nil {
 						logger.Error("Failed to acknowledge GDPR request",
 							zap.Error(ackErr),
-							zap.Uint64("user_id", req.UserId),
+							zap.Uint64("user_id", req.Request.UserId),
 						)
 					}
 				}
@@ -126,18 +133,25 @@ func main() {
 					TotalDeleted:    result.TotalDeleted,
 					MessagesDeleted: result.MessagesDeleted,
 					Error:           result.Error,
-					RequestType:     req.Type,
-					GuildIds:        req.GuildIds,
-					TicketIds:       req.TicketIds,
+					RequestType:     req.Request.Type,
+					GuildIds:        req.Request.GuildIds,
+					TicketIds:       req.Request.TicketIds,
 				}
 
 				callbackCtx, callbackCancel := context.WithTimeout(context.Background(), 30*time.Second)
 				defer callbackCancel()
 
-				if err := callbackHandler.SendCompletion(callbackCtx, req, callbackData); err != nil {
+				if updateErr := database.Client.GdprLogs.UpdateLogStatus(req.RequestID, "Completed"); updateErr != nil {
+					logger.Error("Failed to update GDPR log",
+						zap.Error(updateErr),
+						zap.Uint64("user_id", req.Request.UserId),
+					)
+				}
+
+				if err := callbackHandler.SendCompletion(callbackCtx, req.Request, callbackData); err != nil {
 					logger.Error("Failed to send completion callback",
 						zap.Error(err),
-						zap.Uint64("user_id", req.UserId),
+						zap.Uint64("user_id", req.Request.UserId),
 					)
 				}
 			}(request)
