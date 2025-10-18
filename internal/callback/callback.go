@@ -10,8 +10,8 @@ import (
 	"github.com/TicketsBot-cloud/gdl/rest"
 	"github.com/TicketsBot-cloud/gdl/rest/ratelimit"
 	"github.com/TicketsBot-cloud/gdpr-worker/internal/config"
-	"github.com/TicketsBot-cloud/gdpr-worker/internal/utils"
 	"github.com/TicketsBot-cloud/gdpr-worker/internal/gdprrelay"
+	"github.com/TicketsBot-cloud/gdpr-worker/internal/utils"
 	"github.com/TicketsBot-cloud/gdpr-worker/i18n"
 	"go.uber.org/zap"
 )
@@ -46,7 +46,7 @@ func (c *Callback) SendCompletion(ctx context.Context, request gdprrelay.GDPRReq
 	}
 
 	locale := i18n.GetLocale(request.Language)
-	components := c.buildResultComponents(locale, result)
+	components := c.buildResultComponents(locale, result, request.GuildNames)
 
 	if err := c.editOriginalMessage(ctx, request, components); err != nil {
 		if c.isTokenExpired(err) {
@@ -94,40 +94,48 @@ func (c *Callback) isTokenExpired(err error) bool {
 		strings.Contains(errStr, "context deadline exceeded")
 }
 
-func (c *Callback) buildResultMessage(locale *i18n.Locale, result ResultData) string {
+func (c *Callback) buildResultMessage(locale *i18n.Locale, result ResultData, guildNames map[uint64]string) string {
 	var content string
 
 	switch result.RequestType {
 	case gdprrelay.RequestTypeAllTranscripts:
-		if result.TotalDeleted == 0 {
-			content = i18n.GetMessage(locale, i18n.GdprCompletedNoData)
-		} else if len(result.GuildIds) == 1 {
-			content = i18n.GetMessage(locale, i18n.GdprCompletedAllTranscripts, result.TotalDeleted)
+		if len(result.GuildIds) == 1 {
+			guildDisplay := utils.FormatGuildDisplay(result.GuildIds[0], guildNames)
+			content = i18n.GetMessage(locale, i18n.GdprCompletedAllTranscripts, guildDisplay, result.TotalDeleted)
 		} else {
-			content = i18n.GetMessage(locale, i18n.GdprCompletedAllTranscriptsMulti, len(result.GuildIds), result.TotalDeleted)
+			guildDisplays := make([]string, len(result.GuildIds))
+			for i, guildId := range result.GuildIds {
+				guildDisplays[i] = utils.FormatGuildDisplay(guildId, guildNames)
+			}
+			content = i18n.GetMessage(locale, i18n.GdprCompletedAllTranscriptsMulti, strings.Join(guildDisplays, "\n* "), result.TotalDeleted)
 		}
 
 	case gdprrelay.RequestTypeSpecificTranscripts:
-		if result.TotalDeleted == 0 {
-			content = i18n.GetMessage(locale, i18n.GdprCompletedNoData)
+		if len(result.GuildIds) > 0 {
+			guildDisplay := utils.FormatGuildDisplay(result.GuildIds[0], guildNames)
+			content = i18n.GetMessage(locale, i18n.GdprCompletedSpecificTranscripts, guildDisplay, result.TotalDeleted)
 		} else {
-			content = i18n.GetMessage(locale, i18n.GdprCompletedSpecificTranscripts, result.TotalDeleted)
+			content = i18n.GetMessage(locale, i18n.GdprCompletedSpecificTranscripts, "Unknown", result.TotalDeleted)
 		}
 
 	case gdprrelay.RequestTypeAllMessages:
-		if result.MessagesDeleted == 0 {
-			content = i18n.GetMessage(locale, i18n.GdprCompletedNoData)
-		} else if len(result.GuildIds) == 1 {
-			content = i18n.GetMessage(locale, i18n.GdprCompletedAllMessages, result.MessagesDeleted)
+		if len(result.GuildIds) == 1 {
+			guildDisplay := utils.FormatGuildDisplay(result.GuildIds[0], guildNames)
+			content = i18n.GetMessage(locale, i18n.GdprCompletedAllMessages, guildDisplay, result.MessagesDeleted)
 		} else {
-			content = i18n.GetMessage(locale, i18n.GdprCompletedAllMessagesMulti, len(result.GuildIds), result.MessagesDeleted)
+			guildDisplays := make([]string, len(result.GuildIds))
+			for i, guildId := range result.GuildIds {
+				guildDisplays[i] = utils.FormatGuildDisplay(guildId, guildNames)
+			}
+			content = i18n.GetMessage(locale, i18n.GdprCompletedAllMessagesMulti, strings.Join(guildDisplays, "\n* "), result.MessagesDeleted)
 		}
 
 	case gdprrelay.RequestTypeSpecificMessages:
-		if result.MessagesDeleted == 0 {
-			content = i18n.GetMessage(locale, i18n.GdprCompletedNoData)
+		if len(result.GuildIds) > 0 {
+			guildDisplay := utils.FormatGuildDisplay(result.GuildIds[0], guildNames)
+			content = i18n.GetMessage(locale, i18n.GdprCompletedSpecificMessages, guildDisplay, result.MessagesDeleted)
 		} else {
-			content = i18n.GetMessage(locale, i18n.GdprCompletedSpecificMessages, result.MessagesDeleted)
+			content = i18n.GetMessage(locale, i18n.GdprCompletedSpecificMessages, "Unknown", result.MessagesDeleted)
 		}
 	}
 
@@ -138,7 +146,7 @@ func (c *Callback) buildResultMessage(locale *i18n.Locale, result ResultData) st
 	return content
 }
 
-func (c *Callback) buildResultComponents(locale *i18n.Locale, result ResultData) []component.Component {
+func (c *Callback) buildResultComponents(locale *i18n.Locale, result ResultData, guildNames map[uint64]string) []component.Component {
 	colour := utils.Green
 	if result.Error != nil {
 		colour = utils.Red
@@ -146,7 +154,7 @@ func (c *Callback) buildResultComponents(locale *i18n.Locale, result ResultData)
 
 	innerComponents := []component.Component{
 		component.BuildTextDisplay(component.TextDisplay{
-			Content: c.buildResultMessage(locale, result),
+			Content: c.buildResultMessage(locale, result, guildNames),
 		}),
 	}
 
@@ -202,7 +210,7 @@ func (c *Callback) sendCompletionViaDM(ctx context.Context, request gdprrelay.GD
 		return fmt.Errorf("failed to create DM channel: %w", err)
 	}
 
-	components := c.buildResultComponents(locale, result)
+	components := c.buildResultComponents(locale, result, request.GuildNames)
 
 	data := rest.CreateMessageData{
 		Components: components,

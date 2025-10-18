@@ -10,7 +10,6 @@ var (
 	GdprCompletedAllMessages         MessageId = "gdpr.completed.all_messages"
 	GdprCompletedAllMessagesMulti    MessageId = "gdpr.completed.all_messages_multi"
 	GdprCompletedSpecificMessages    MessageId = "gdpr.completed.specific_messages"
-	GdprCompletedNoData              MessageId = "gdpr.completed.no_data"
 	GdprCompletedError               MessageId = "gdpr.completed.error"
 	GdprFollowupError                MessageId = "gdpr.followup.error"
 	GdprFollowupNoData               MessageId = "gdpr.followup.no_data"

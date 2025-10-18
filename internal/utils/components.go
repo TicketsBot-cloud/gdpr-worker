@@ -2,6 +2,7 @@ package utils
 
 import (
 	"fmt"
+	"strconv"
 
 	"github.com/TicketsBot-cloud/gdl/objects/interaction/component"
 )
@@ -42,4 +43,11 @@ func BuildContainerWithComponents(colour Colour, title string, innerComponents [
 		AccentColor: &accentColor,
 		Components:  components,
 	})
+}
+
+func FormatGuildDisplay(guildId uint64, guildNames map[uint64]string) string {
+	if name, ok := guildNames[guildId]; ok && name != "" {
+		return name + " (ID: " + strconv.FormatUint(guildId, 10) + ")"
+	}
+	return "ID: " + strconv.FormatUint(guildId, 10)
 }
