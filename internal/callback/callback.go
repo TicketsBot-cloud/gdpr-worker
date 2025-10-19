@@ -17,12 +17,12 @@ import (
 )
 
 type ResultData struct {
-	TotalDeleted     int
-	MessagesDeleted  int
-	Error            error
-	RequestType      gdprrelay.RequestType
-	GuildIds         []uint64
-	TicketIds        []int
+	TranscriptsDeleted int
+	MessagesDeleted    int
+	Error              error
+	RequestType        gdprrelay.RequestType
+	GuildIds           []uint64
+	TicketIds          []int
 }
 
 type Callback struct {
@@ -45,6 +45,7 @@ func (c *Callback) SendCompletion(ctx context.Context, request gdprrelay.GDPRReq
 		return nil
 	}
 
+	scrambledUserId := utils.ScrambleUserId(request.UserId)
 	locale := i18n.GetLocale(request.Language)
 	components := c.buildResultComponents(locale, result, request.GuildNames)
 
@@ -53,7 +54,7 @@ func (c *Callback) SendCompletion(ctx context.Context, request gdprrelay.GDPRReq
 			if dmErr := c.sendCompletionViaDM(ctx, request, locale, result); dmErr != nil {
 				c.logger.Error("Failed to send completion via DM",
 					zap.Error(dmErr),
-					zap.Uint64("user_id", request.UserId),
+					zap.String("scrambled_user_id", scrambledUserId),
 				)
 				return dmErr
 			}
@@ -62,7 +63,7 @@ func (c *Callback) SendCompletion(ctx context.Context, request gdprrelay.GDPRReq
 
 		c.logger.Error("Failed to edit original message",
 			zap.Error(err),
-			zap.Uint64("user_id", request.UserId),
+			zap.String("scrambled_user_id", scrambledUserId),
 		)
 		return err
 	}
@@ -74,7 +75,7 @@ func (c *Callback) SendCompletion(ctx context.Context, request gdprrelay.GDPRReq
 
 		c.logger.Error("Failed to send ephemeral follow-up",
 			zap.Error(err),
-			zap.Uint64("user_id", request.UserId),
+			zap.String("scrambled_user_id", scrambledUserId),
 		)
 	}
 
@@ -101,21 +102,21 @@ func (c *Callback) buildResultMessage(locale *i18n.Locale, result ResultData, gu
 	case gdprrelay.RequestTypeAllTranscripts:
 		if len(result.GuildIds) == 1 {
 			guildDisplay := utils.FormatGuildDisplay(result.GuildIds[0], guildNames)
-			content = i18n.GetMessage(locale, i18n.GdprCompletedAllTranscripts, guildDisplay, result.TotalDeleted)
+			content = i18n.GetMessage(locale, i18n.GdprCompletedAllTranscripts, guildDisplay, result.TranscriptsDeleted)
 		} else {
 			guildDisplays := make([]string, len(result.GuildIds))
 			for i, guildId := range result.GuildIds {
 				guildDisplays[i] = utils.FormatGuildDisplay(guildId, guildNames)
 			}
-			content = i18n.GetMessage(locale, i18n.GdprCompletedAllTranscriptsMulti, strings.Join(guildDisplays, "\n* "), result.TotalDeleted)
+			content = i18n.GetMessage(locale, i18n.GdprCompletedAllTranscriptsMulti, strings.Join(guildDisplays, "\n* "), result.TranscriptsDeleted)
 		}
 
 	case gdprrelay.RequestTypeSpecificTranscripts:
 		if len(result.GuildIds) > 0 {
 			guildDisplay := utils.FormatGuildDisplay(result.GuildIds[0], guildNames)
-			content = i18n.GetMessage(locale, i18n.GdprCompletedSpecificTranscripts, guildDisplay, result.TotalDeleted)
+			content = i18n.GetMessage(locale, i18n.GdprCompletedSpecificTranscripts, guildDisplay, result.TranscriptsDeleted)
 		} else {
-			content = i18n.GetMessage(locale, i18n.GdprCompletedSpecificTranscripts, "Unknown", result.TotalDeleted)
+			content = i18n.GetMessage(locale, i18n.GdprCompletedSpecificTranscripts, "Unknown", result.TranscriptsDeleted)
 		}
 
 	case gdprrelay.RequestTypeAllMessages:
@@ -178,7 +179,7 @@ func (c *Callback) sendEphemeralFollowup(ctx context.Context, request gdprrelay.
 
 	if result.Error != nil {
 		content = i18n.GetMessage(locale, i18n.GdprFollowupError, result.Error.Error())
-	} else if result.TotalDeleted == 0 && result.MessagesDeleted == 0 {
+	} else if result.TranscriptsDeleted == 0 && result.MessagesDeleted == 0 {
 		content = i18n.GetMessage(locale, i18n.GdprFollowupNoData)
 	} else {
 		content = i18n.GetMessage(locale, i18n.GdprFollowupSuccess)
@@ -194,9 +195,11 @@ func (c *Callback) sendEphemeralFollowup(ctx context.Context, request gdprrelay.
 }
 
 func (c *Callback) sendCompletionViaDM(ctx context.Context, request gdprrelay.GDPRRequest, locale *i18n.Locale, result ResultData) error {
+	scrambledUserId := utils.ScrambleUserId(request.UserId)
+
 	if config.Conf.Discord.Token == "" {
 		c.logger.Error("Discord token not configured, cannot send DM",
-			zap.Uint64("user_id", request.UserId),
+			zap.String("scrambled_user_id", scrambledUserId),
 		)
 		return fmt.Errorf("discord token not configured")
 	}
@@ -205,7 +208,7 @@ func (c *Callback) sendCompletionViaDM(ctx context.Context, request gdprrelay.GD
 	if err != nil {
 		c.logger.Error("Failed to create DM channel",
 			zap.Error(err),
-			zap.Uint64("user_id", request.UserId),
+			zap.String("scrambled_user_id", scrambledUserId),
 		)
 		return fmt.Errorf("failed to create DM channel: %w", err)
 	}
@@ -221,7 +224,7 @@ func (c *Callback) sendCompletionViaDM(ctx context.Context, request gdprrelay.GD
 	if err != nil {
 		c.logger.Error("Failed to send DM message",
 			zap.Error(err),
-			zap.Uint64("user_id", request.UserId),
+			zap.String("scrambled_user_id", scrambledUserId),
 			zap.Uint64("channel_id", dmChannel.Id),
 		)
 		return fmt.Errorf("failed to send DM message: %w", err)

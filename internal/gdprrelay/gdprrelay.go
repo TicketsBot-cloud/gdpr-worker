@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/TicketsBot-cloud/gdpr-worker/internal/utils"
 	"github.com/go-redis/redis/v8"
 	"go.uber.org/zap"
 )
@@ -81,10 +82,10 @@ func Listen(redisClient *redis.Client, ch chan QueuedRequest, logger *zap.Logger
 		queued.LastAttemptAt = time.Now()
 
 		logger.Info("Dequeued GDPR request",
+			zap.String("scrambled_user_id", utils.ScrambleUserId(queued.Request.UserId)),
+			zap.String("request_type", utils.GetRequestTypeName(int(queued.Request.Type))),
 			zap.Int("request_id", queued.RequestID),
 			zap.Int("retry_count", queued.RetryCount),
-			zap.Int("type", int(queued.Request.Type)),
-			zap.Uint64("user_id", queued.Request.UserId),
 		)
 
 		ch <- queued
@@ -113,8 +114,8 @@ func Acknowledge(ctx context.Context, redisClient *redis.Client, request GDPRReq
 	}
 
 	logger.Warn("Request not found in processing queue for acknowledgment",
-		zap.Uint64("user_id", request.UserId),
-		zap.Int("type", int(request.Type)),
+		zap.String("scrambled_user_id", utils.ScrambleUserId(request.UserId)),
+		zap.String("request_type", utils.GetRequestTypeName(int(request.Type))),
 	)
 	return nil
 }
@@ -134,8 +135,9 @@ func Reject(ctx context.Context, redisClient *redis.Client, request GDPRRequest,
 		if requestsMatch(queued.Request, request) {
 			if _, removeErr := redisClient.LRem(ctx, keyProcessing, 1, item).Result(); removeErr != nil {
 				logger.Error("Failed to remove from processing queue",
-					zap.Error(removeErr),
+					zap.String("scrambled_user_id", utils.ScrambleUserId(queued.Request.UserId)),
 					zap.Int("request_id", queued.RequestID),
+					zap.Error(removeErr),
 				)
 				return removeErr
 			}
@@ -144,6 +146,7 @@ func Reject(ctx context.Context, redisClient *redis.Client, request GDPRRequest,
 
 			if queued.RetryCount >= maxRetries {
 				logger.Warn("GDPR request exceeded max retries",
+					zap.String("scrambled_user_id", utils.ScrambleUserId(queued.Request.UserId)),
 					zap.Int("request_id", queued.RequestID),
 					zap.Int("retry_count", queued.RetryCount),
 					zap.Error(err),
@@ -154,6 +157,7 @@ func Reject(ctx context.Context, redisClient *redis.Client, request GDPRRequest,
 			}
 
 			logger.Info("Requeuing failed GDPR request",
+				zap.String("scrambled_user_id", utils.ScrambleUserId(queued.Request.UserId)),
 				zap.Int("request_id", queued.RequestID),
 				zap.Int("retry_count", queued.RetryCount),
 				zap.Error(err),
@@ -169,8 +173,8 @@ func Reject(ctx context.Context, redisClient *redis.Client, request GDPRRequest,
 	}
 
 	logger.Warn("Request not found in processing queue for rejection",
-		zap.Uint64("user_id", request.UserId),
-		zap.Int("type", int(request.Type)),
+		zap.String("scrambled_user_id", utils.ScrambleUserId(request.UserId)),
+		zap.String("request_type", utils.GetRequestTypeName(int(request.Type))),
 	)
 	return nil
 }

@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"fmt"
 	"os"
 	"os/signal"
 	"syscall"
@@ -16,6 +15,7 @@ import (
 	"github.com/TicketsBot-cloud/gdpr-worker/internal/gdprrelay"
 	"github.com/TicketsBot-cloud/gdpr-worker/internal/heartbeat"
 	"github.com/TicketsBot-cloud/gdpr-worker/internal/processor"
+	"github.com/TicketsBot-cloud/gdpr-worker/internal/utils"
 	"github.com/go-redis/redis/v8"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
@@ -50,7 +50,7 @@ func main() {
 
 	logger.Info("Connecting to database")
 	if err := database.Connect(
-		logger.With(zap.String("service", "database")),
+		logger.With(),
 		config.Conf.Database.Host,
 		config.Conf.Database.Database,
 		config.Conf.Database.Username,
@@ -63,28 +63,26 @@ func main() {
 
 	logger.Info("Initializing archiver client")
 	archiver.Initialize(
-		logger.With(zap.String("service", "archiver")),
+		logger.With(),
 		config.Conf.Archiver.Url,
 		config.Conf.Archiver.AesKey,
 	)
 
-	proc := processor.New(logger.With(zap.String("service", "processor")))
+	proc := processor.New(logger.With())
 
 	callbackHandler := callback.New(
-		logger.With(zap.String("service", "callback")),
+		logger.With(),
 		config.Conf.Discord.ProxyUrl,
 	)
 
 	logger.Info("Starting heartbeat")
 	heartbeatCtx, heartbeatCancel := context.WithCancel(context.Background())
 	defer heartbeatCancel()
-	go heartbeat.Start(heartbeatCtx, redisClient, logger.With(zap.String("service", "heartbeat")))
+	go heartbeat.Start(heartbeatCtx, redisClient, logger.With())
 
-	logger.Info("Starting GDPR queue listener",
-		zap.Int("max_concurrency", config.Conf.MaxConcurrency),
-	)
+	logger.Info("Starting GDPR queue listener")
 	ch := make(chan gdprrelay.QueuedRequest)
-	go gdprrelay.Listen(redisClient, ch, logger.With(zap.String("service", "gdprrelay")))
+	go gdprrelay.Listen(redisClient, ch, logger.With())
 
 	semaphore := make(chan struct{}, config.Conf.MaxConcurrency)
 
@@ -99,44 +97,52 @@ func main() {
 
 				processCtx := context.Background()
 
+				scrambledId := utils.ScrambleUserId(req.Request.UserId)
+				requestTypeName := utils.GetRequestTypeName(int(req.Request.Type))
+
 				logger.Info("Processing GDPR request",
-					zap.Int("type", int(req.Request.Type)),
-					zap.Uint64("user_id", req.Request.UserId),
+					zap.String("scrambled_user_id", scrambledId),
+					zap.String("request_type", requestTypeName),
+					zap.Uint64("request_id", uint64(req.RequestID)),
 				)
 
 				result := proc.Process(processCtx, req.Request)
 
 				if result.Error != nil {
 					logger.Error("Failed to process GDPR request",
-						zap.Int("type", int(req.Request.Type)),
-						zap.Uint64("user_id", req.Request.UserId),
+						zap.String("scrambled_user_id", scrambledId),
+						zap.String("request_type", requestTypeName),
+						zap.Uint64("request_id", uint64(req.RequestID)),
 						zap.Error(result.Error),
 					)
 
 					if updateErr := database.Client.GdprLogs.UpdateLogStatus(req.RequestID, "Failed"); updateErr != nil {
 						logger.Error("Failed to update GDPR log",
+							zap.Uint64("request_id", uint64(req.RequestID)),
+							zap.String("scrambled_user_id", scrambledId),
 							zap.Error(updateErr),
-							zap.Uint64("user_id", req.Request.UserId),
 						)
 					}
 
 					if rejectErr := gdprrelay.Reject(processCtx, redisClient, req.Request, logger); rejectErr != nil {
 						logger.Error("Failed to reject GDPR request",
+							zap.Uint64("request_id", uint64(req.RequestID)),
+							zap.String("scrambled_user_id", scrambledId),
 							zap.Error(rejectErr),
-							zap.Uint64("user_id", req.Request.UserId),
 						)
 					}
 				} else {
 					if ackErr := gdprrelay.Acknowledge(processCtx, redisClient, req.Request, logger); ackErr != nil {
 						logger.Error("Failed to acknowledge GDPR request",
+							zap.Uint64("request_id", uint64(req.RequestID)),
+							zap.String("scrambled_user_id", scrambledId),
 							zap.Error(ackErr),
-							zap.Uint64("user_id", req.Request.UserId),
 						)
 					}
 				}
 
 				callbackData := callback.ResultData{
-					TotalDeleted:    result.TotalDeleted,
+					TranscriptsDeleted:    result.TranscriptsDeleted,
 					MessagesDeleted: result.MessagesDeleted,
 					Error:           result.Error,
 					RequestType:     req.Request.Type,
@@ -148,16 +154,18 @@ func main() {
 				defer callbackCancel()
 
 				if updateErr := database.Client.GdprLogs.UpdateLogStatus(req.RequestID, "Completed"); updateErr != nil {
-					logger.Error("Failed to update GDPR log",
+					logger.Error("Failed to update GDPR log status to Completed",
+						zap.Uint64("request_id", uint64(req.RequestID)),
+						zap.String("scrambled_user_id", scrambledId),
 						zap.Error(updateErr),
-						zap.Uint64("user_id", req.Request.UserId),
 					)
 				}
 
 				if err := callbackHandler.SendCompletion(callbackCtx, req.Request, callbackData); err != nil {
 					logger.Error("Failed to send completion callback",
+						zap.Uint64("request_id", uint64(req.RequestID)),
+						zap.String("scrambled_user_id", scrambledId),
 						zap.Error(err),
-						zap.Uint64("user_id", req.Request.UserId),
 					)
 				}
 			}(request)
@@ -173,7 +181,6 @@ func main() {
 	logger.Info("Received shutdown signal, cleaning up...")
 
 	logger.Info("GDPR Worker shutdown complete")
-	fmt.Println("GDPR Worker stopped")
 }
 
 func initLogger(jsonLogs bool, level zapcore.Level) *zap.Logger {
@@ -186,6 +193,8 @@ func initLogger(jsonLogs bool, level zapcore.Level) *zap.Logger {
 	}
 
 	config.Level = zap.NewAtomicLevelAt(level)
+	config.DisableCaller = true        // Disable file/line information
+	config.DisableStacktrace = true     // Disable stack traces
 
 	logger, err := config.Build()
 	if err != nil {

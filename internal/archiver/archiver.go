@@ -17,5 +17,5 @@ func Initialize(logger *zap.Logger, url, aesKey string) {
 		[]byte(aesKey),
 	)
 
-	logger.Info("Archiver client initialized", zap.String("url", url))
+	logger.Info("Archiver client initialized")
 }

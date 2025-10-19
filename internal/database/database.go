@@ -19,11 +19,7 @@ func Connect(logger *zap.Logger, host, dbName, username, password string, thread
 		return fmt.Errorf("failed to connect to database: %w", err)
 	}
 
-	logger.Info("Connected to database",
-		zap.String("host", host),
-		zap.String("database", dbName),
-		zap.Int("threads", threads),
-	)
+	logger.Info("Connected to database")
 
 	Client = database.NewDatabase(pool)
 

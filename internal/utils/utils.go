@@ -1,8 +1,9 @@
 package utils
 
 import (
-	"fmt"
+	"crypto/sha256"
 	"strconv"
+	"fmt"
 
 	"github.com/TicketsBot-cloud/gdl/objects/interaction/component"
 )
@@ -50,4 +51,25 @@ func FormatGuildDisplay(guildId uint64, guildNames map[uint64]string) string {
 		return name + " (" + strconv.FormatUint(guildId, 10) + ")"
 	}
 	return strconv.FormatUint(guildId, 10)
+}
+
+func ScrambleUserId(userId uint64) string {
+	h := sha256.New()
+	fmt.Fprintf(h, "%d", userId)
+	return fmt.Sprintf("%x", h.Sum(nil))
+}
+
+func GetRequestTypeName(requestType int) string {
+	switch requestType {
+	case 0:
+		return "AllTranscripts"
+	case 1:
+		return "SpecificTranscripts"
+	case 2:
+		return "AllMessages"
+	case 3:
+		return "SpecificMessages"
+	default:
+		return fmt.Sprintf("Unknown(%d)", requestType)
+	}
 }

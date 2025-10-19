@@ -13,6 +13,7 @@ import (
 	"github.com/TicketsBot-cloud/gdpr-worker/internal/config"
 	"github.com/TicketsBot-cloud/gdpr-worker/internal/database"
 	"github.com/TicketsBot-cloud/gdpr-worker/internal/gdprrelay"
+	"github.com/TicketsBot-cloud/gdpr-worker/internal/utils"
 	v2 "github.com/TicketsBot-cloud/logarchiver/pkg/model/v2"
 	"go.uber.org/zap"
 )
@@ -31,9 +32,9 @@ func New(logger *zap.Logger) *Processor {
 }
 
 type ProcessResult struct {
-	TotalDeleted    int
-	MessagesDeleted int
-	Error           error
+	TranscriptsDeleted int
+	MessagesDeleted    int
+	Error              error
 }
 
 func (p *Processor) Process(ctx context.Context, request gdprrelay.GDPRRequest) ProcessResult {
@@ -52,10 +53,12 @@ func (p *Processor) Process(ctx context.Context, request gdprrelay.GDPRRequest) 
 }
 
 func (p *Processor) verifyGuildOwnership(ctx context.Context, guildId, userId uint64) error {
+	scrambledUserId := utils.ScrambleUserId(userId)
+
 	if config.Conf.Discord.Token == "" {
 		p.logger.Warn("Discord token not configured, skipping ownership verification",
+			zap.String("scrambled_user_id", scrambledUserId),
 			zap.Uint64("guild_id", guildId),
-			zap.Uint64("user_id", userId),
 		)
 		return nil
 	}
@@ -63,8 +66,8 @@ func (p *Processor) verifyGuildOwnership(ctx context.Context, guildId, userId ui
 	guild, err := rest.GetGuild(ctx, config.Conf.Discord.Token, p.rateLimiter, guildId)
 	if err != nil {
 		p.logger.Error("Failed to fetch guild for ownership verification",
+			zap.String("scrambled_user_id", scrambledUserId),
 			zap.Uint64("guild_id", guildId),
-			zap.Uint64("user_id", userId),
 			zap.Error(err),
 		)
 		return fmt.Errorf("failed to verify guild ownership: unable to fetch guild information")
@@ -72,16 +75,16 @@ func (p *Processor) verifyGuildOwnership(ctx context.Context, guildId, userId ui
 
 	if guild.OwnerId != userId {
 		p.logger.Warn("Ownership verification failed",
+			zap.String("scrambled_user_id", scrambledUserId),
 			zap.Uint64("guild_id", guildId),
-			zap.Uint64("user_id", userId),
-			zap.Uint64("actual_owner_id", guild.OwnerId),
+			zap.String("scrambled_actual_owner_id", utils.ScrambleUserId(guild.OwnerId)),
 		)
 		return fmt.Errorf("you are not the owner of this server (ID: %d)", guildId)
 	}
 
 	p.logger.Debug("Guild ownership verified",
+		zap.String("scrambled_user_id", scrambledUserId),
 		zap.Uint64("guild_id", guildId),
-		zap.Uint64("user_id", userId),
 	)
 
 	return nil
@@ -101,15 +104,18 @@ func (p *Processor) processAllTranscripts(ctx context.Context, request gdprrelay
 		return ProcessResult{Error: fmt.Errorf("invalid server ID provided")}
 	}
 
+	scrambledUserId := utils.ScrambleUserId(request.UserId)
+	requestTypeName := utils.GetRequestTypeName(int(request.Type))
+
 	if err := p.verifyAllGuildsOwnership(ctx, request.GuildIds, request.UserId); err != nil {
 		p.logger.Error("Guild ownership verification failed",
-			zap.Uint64("user_id", request.UserId),
+			zap.String("scrambled_user_id", scrambledUserId),
 			zap.Error(err),
 		)
 		return ProcessResult{Error: err}
 	}
 
-	totalDeleted := 0
+	transcriptsDeleted := 0
 	var lastError error
 
 	for _, guildId := range request.GuildIds {
@@ -117,28 +123,28 @@ func (p *Processor) processAllTranscripts(ctx context.Context, request gdprrelay
 		if err != nil {
 			lastError = err
 			p.logger.Error("Failed to delete transcripts",
-				zap.Uint64("guild_id", guildId),
+				zap.String("scrambled_user_id", scrambledUserId),
+				zap.String("request_type", requestTypeName),
 				zap.Error(err),
 			)
 			continue
 		}
-		totalDeleted += deleted
+		transcriptsDeleted += deleted
 	}
 
-	if totalDeleted > 0 {
+	if transcriptsDeleted > 0 {
 		p.logger.Info("GDPR request completed",
-			zap.String("type", "all_transcripts"),
-			zap.Uint64("user_id", request.UserId),
-			zap.Int("total_deleted", totalDeleted),
-			zap.Int("guilds", len(request.GuildIds)),
+			zap.String("scrambled_user_id", scrambledUserId),
+			zap.String("request_type", requestTypeName),
+			zap.Int("transcripts_deleted", transcriptsDeleted),
 		)
 	}
 
 	result := ProcessResult{
-		TotalDeleted: totalDeleted,
+		TranscriptsDeleted: transcriptsDeleted,
 	}
 
-	if totalDeleted == 0 && lastError != nil {
+	if transcriptsDeleted == 0 && lastError != nil {
 		result.Error = fmt.Errorf("failed to delete any transcripts: %w", lastError)
 	}
 
@@ -154,34 +160,38 @@ func (p *Processor) processSpecificTranscripts(ctx context.Context, request gdpr
 	}
 
 	guildId := request.GuildIds[0]
+	scrambledUserId := utils.ScrambleUserId(request.UserId)
+	requestTypeName := utils.GetRequestTypeName(int(request.Type))
 
 	if err := p.verifyGuildOwnership(ctx, guildId, request.UserId); err != nil {
 		p.logger.Error("Guild ownership verification failed",
-			zap.Uint64("guild_id", guildId),
-			zap.Uint64("user_id", request.UserId),
+			zap.String("scrambled_user_id", scrambledUserId),
+			zap.String("request_type", requestTypeName),
 			zap.Error(err),
 		)
 		return ProcessResult{Error: err}
 	}
 
-	deleted, err := p.deleteSpecificTranscripts(ctx, guildId, request.TicketIds)
+	transcriptsDeleted, err := p.deleteSpecificTranscripts(ctx, guildId, request.TicketIds)
 	if err != nil {
 		return ProcessResult{Error: fmt.Errorf("failed to delete specific transcripts: %w", err)}
 	}
 
 	p.logger.Info("GDPR request completed",
-		zap.String("type", "specific_transcripts"),
-		zap.Uint64("guild_id", guildId),
-		zap.Uint64("user_id", request.UserId),
-		zap.Int("deleted", deleted),
+		zap.String("scrambled_user_id", scrambledUserId),
+		zap.String("request_type", requestTypeName),
+		zap.Int("transcripts_deleted", transcriptsDeleted),
 	)
 
-	return ProcessResult{TotalDeleted: deleted}
+	return ProcessResult{TranscriptsDeleted: transcriptsDeleted}
 }
 
 func (p *Processor) processAllMessages(ctx context.Context, request gdprrelay.GDPRRequest) ProcessResult {
 	var messagesDeleted int
 	var err error
+
+	scrambledUserId := utils.ScrambleUserId(request.UserId)
+	requestTypeName := utils.GetRequestTypeName(int(request.Type))
 
 	messagesDeleted, err = p.deleteUserMessagesFromGuilds(ctx, request.GuildIds, request.UserId)
 	if err != nil {
@@ -189,9 +199,8 @@ func (p *Processor) processAllMessages(ctx context.Context, request gdprrelay.GD
 	}
 
 	p.logger.Info("GDPR request completed",
-		zap.String("type", "all_messages"),
-		zap.Uint64("user_id", request.UserId),
-		zap.Uint64s("guild_ids", request.GuildIds),
+		zap.String("scrambled_user_id", scrambledUserId),
+		zap.String("request_type", requestTypeName),
 		zap.Int("messages_deleted", messagesDeleted),
 	)
 
@@ -209,15 +218,17 @@ func (p *Processor) processSpecificMessages(ctx context.Context, request gdprrel
 	}
 
 	guildId := request.GuildIds[0]
+	scrambledUserId := utils.ScrambleUserId(request.UserId)
+	requestTypeName := utils.GetRequestTypeName(int(request.Type))
+
 	messagesDeleted, err := p.deleteUserMessagesFromTickets(ctx, guildId, request.TicketIds, request.UserId)
 	if err != nil {
 		return ProcessResult{Error: fmt.Errorf("failed to delete specific user messages: %w", err)}
 	}
 
 	p.logger.Info("GDPR request completed",
-		zap.String("type", "specific_messages"),
-		zap.Uint64("guild_id", guildId),
-		zap.Uint64("user_id", request.UserId),
+		zap.String("scrambled_user_id", scrambledUserId),
+		zap.String("request_type", requestTypeName),
 		zap.Int("messages_deleted", messagesDeleted),
 	)
 

@@ -15,11 +15,7 @@ const (
 )
 
 func Start(ctx context.Context, redisClient *redis.Client, logger *zap.Logger) {
-	logger.Info("Starting heartbeat",
-		zap.String("key", HeartbeatKey),
-		zap.Duration("interval", HeartbeatInterval),
-		zap.Duration("ttl", HeartbeatTTL),
-	)
+	logger.Info("Starting heartbeat")
 
 	ticker := time.NewTicker(HeartbeatInterval)
 	defer ticker.Stop()
