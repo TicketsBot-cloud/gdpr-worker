@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/TicketsBot-cloud/gdpr-worker/internal/utils"
+	"github.com/TicketsBot-cloud/gdpr-worker/internal/config"
 	"github.com/go-redis/redis/v8"
 	"go.uber.org/zap"
 )
@@ -47,7 +48,6 @@ const (
 	keyPending    = "tickets:gdpr:pending"    // Redis list for queued GDPR requests awaiting processing
 	keyProcessing = "tickets:gdpr:processing" // Redis list for GDPR requests currently being processed
 	keyFailed     = "tickets:gdpr:failed"     // Redis list for GDPR requests that exceeded max retries
-	maxRetries    = 3                         // Maximum number of retry attempts for failed requests
 )
 
 func Listen(redisClient *redis.Client, ch chan QueuedRequest, logger *zap.Logger) {
@@ -146,7 +146,7 @@ func Reject(ctx context.Context, redisClient *redis.Client, request GDPRRequest,
 
 			queued.RetryCount++
 
-			if queued.RetryCount >= maxRetries {
+			if queued.RetryCount >= config.Conf.MaxRetries {
 				logger.Warn("GDPR request exceeded max retries",
 					zap.String("scrambled_user_id", utils.ScrambleUserId(queued.Request.UserId)),
 					zap.Int("request_id", queued.RequestID),
