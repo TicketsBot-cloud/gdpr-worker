@@ -18,6 +18,7 @@ import (
 	"go.uber.org/zap"
 )
 
+// Processor handles the execution of GDPR data deletion requests
 type Processor struct {
 	logger      *zap.Logger
 	rateLimiter *ratelimit.Ratelimiter
@@ -31,10 +32,11 @@ func New(logger *zap.Logger) *Processor {
 	}
 }
 
+// ProcessResult contains the outcome of processing a GDPR request
 type ProcessResult struct {
-	TranscriptsDeleted int
-	MessagesDeleted    int
-	Error              error
+	TranscriptsDeleted int   // Number of transcript archives deleted from archiver
+	MessagesDeleted    int   // Number of ticket messages deleted from database
+	Error              error // Error if the processing failed, nil on success
 }
 
 func (p *Processor) Process(ctx context.Context, request gdprrelay.GDPRRequest) ProcessResult {
@@ -238,7 +240,6 @@ func (p *Processor) processSpecificMessages(ctx context.Context, request gdprrel
 }
 
 // Transcript deletion helpers
-
 func (p *Processor) deleteAllTranscripts(ctx context.Context, guildId uint64) (int, error) {
 	ticketIds, err := p.getTranscriptTicketIds(ctx, guildId, nil)
 	if err != nil {
@@ -313,18 +314,17 @@ func (p *Processor) deleteTranscript(ctx context.Context, guildId uint64, ticket
 }
 
 // Message deletion helpers
-
-type ticketInfo struct {
-	ID      int
-	GuildID uint64
-}
-
 func (p *Processor) deleteUserMessagesFromGuilds(ctx context.Context, guildIds []uint64, userId uint64) (messagesDeleted int, err error) {
 	tickets, err := p.getUserTicketsInGuilds(ctx, userId, guildIds)
 	if err != nil {
 		return 0, err
 	}
 	return p.cleanUserMessagesInTickets(ctx, tickets, userId)
+}
+
+type ticketInfo struct {
+	ID      int
+	GuildID uint64
 }
 
 func (p *Processor) deleteUserMessagesFromTickets(ctx context.Context, guildId uint64, ticketIds []int, userId uint64) (messagesDeleted int, err error) {
@@ -497,7 +497,6 @@ func (p *Processor) cleanUserMessages(ctx context.Context, guildId uint64, ticke
 			zap.Int("ticket_id", ticketId),
 			zap.Error(err),
 		)
-		// Don't return error - the transcript was successfully cleaned and stored
 	}
 
 	return count, nil

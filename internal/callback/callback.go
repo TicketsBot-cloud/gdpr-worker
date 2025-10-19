@@ -16,13 +16,14 @@ import (
 	"go.uber.org/zap"
 )
 
+// ResultData contains the result of a GDPR request to be sent back to the user
 type ResultData struct {
-	TranscriptsDeleted int
-	MessagesDeleted    int
-	Error              error
-	RequestType        gdprrelay.RequestType
-	GuildIds           []uint64
-	TicketIds          []int
+	TranscriptsDeleted int                   // Number of transcript archives deleted
+	MessagesDeleted    int                   // Number of ticket messages deleted
+	Error              error                 // Error if the processing failed
+	RequestType        gdprrelay.RequestType // Type of GDPR request that was processed
+	GuildIds           []uint64              // Guild IDs affected by this request
+	TicketIds          []int                 // Ticket IDs affected by this request
 }
 
 type Callback struct {

@@ -53,12 +53,16 @@ func FormatGuildDisplay(guildId uint64, guildNames map[uint64]string) string {
 	return strconv.FormatUint(guildId, 10)
 }
 
+// ScrambleUserId creates a SHA256 hash of the user ID for privacy-safe logging
+// This ensures logs don't expose actual user IDs while maintaining GDPR compliance
 func ScrambleUserId(userId uint64) string {
 	h := sha256.New()
 	fmt.Fprintf(h, "%d", userId)
 	return fmt.Sprintf("%x", h.Sum(nil))
 }
 
+// GetRequestTypeName converts a request type integer to a human-readable string for logging
+// Request types: 0=AllTranscripts, 1=SpecificTranscripts, 2=AllMessages, 3=SpecificMessages
 func GetRequestTypeName(requestType int) string {
 	switch requestType {
 	case 0:

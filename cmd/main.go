@@ -193,8 +193,8 @@ func initLogger(jsonLogs bool, level zapcore.Level) *zap.Logger {
 	}
 
 	config.Level = zap.NewAtomicLevelAt(level)
-	config.DisableCaller = true        // Disable file/line information
-	config.DisableStacktrace = true     // Disable stack traces
+	config.DisableCaller = true
+	config.DisableStacktrace = true
 
 	logger, err := config.Build()
 	if err != nil {

@@ -11,15 +11,17 @@ import (
 	"go.uber.org/zap"
 )
 
+// RequestType defines the type of GDPR data deletion request
 type RequestType int
 
 const (
-	RequestTypeAllTranscripts RequestType = iota
-	RequestTypeSpecificTranscripts
-	RequestTypeAllMessages
-	RequestTypeSpecificMessages
+	RequestTypeAllTranscripts      RequestType = iota // Delete all transcript archives for specified guilds
+	RequestTypeSpecificTranscripts                    // Delete specific transcript archives by ticket IDs
+	RequestTypeAllMessages                            // Delete all ticket messages for specified guilds
+	RequestTypeSpecificMessages                       // Delete specific ticket messages by ticket IDs
 )
 
+// GDPRRequest represents a user's request to delete their data under GDPR regulations
 type GDPRRequest struct {
 	Type               RequestType       `json:"type"`
 	UserId             uint64            `json:"user_id"`
@@ -42,10 +44,10 @@ type QueuedRequest struct {
 }
 
 const (
-	keyPending    = "tickets:gdpr:pending"
-	keyProcessing = "tickets:gdpr:processing"
-	keyFailed     = "tickets:gdpr:failed"
-	maxRetries    = 3
+	keyPending    = "tickets:gdpr:pending"    // Redis list for queued GDPR requests awaiting processing
+	keyProcessing = "tickets:gdpr:processing" // Redis list for GDPR requests currently being processed
+	keyFailed     = "tickets:gdpr:failed"     // Redis list for GDPR requests that exceeded max retries
+	maxRetries    = 3                         // Maximum number of retry attempts for failed requests
 )
 
 func Listen(redisClient *redis.Client, ch chan QueuedRequest, logger *zap.Logger) {
