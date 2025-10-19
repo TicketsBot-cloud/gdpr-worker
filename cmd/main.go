@@ -14,6 +14,7 @@ import (
 	"github.com/TicketsBot-cloud/gdpr-worker/internal/config"
 	"github.com/TicketsBot-cloud/gdpr-worker/internal/database"
 	"github.com/TicketsBot-cloud/gdpr-worker/internal/gdprrelay"
+	"github.com/TicketsBot-cloud/gdpr-worker/internal/heartbeat"
 	"github.com/TicketsBot-cloud/gdpr-worker/internal/processor"
 	"github.com/go-redis/redis/v8"
 	"go.uber.org/zap"
@@ -73,6 +74,11 @@ func main() {
 		logger.With(zap.String("service", "callback")),
 		config.Conf.Discord.ProxyUrl,
 	)
+
+	logger.Info("Starting heartbeat")
+	heartbeatCtx, heartbeatCancel := context.WithCancel(context.Background())
+	defer heartbeatCancel()
+	go heartbeat.Start(heartbeatCtx, redisClient, logger.With(zap.String("service", "heartbeat")))
 
 	logger.Info("Starting GDPR queue listener",
 		zap.Int("max_concurrency", config.Conf.MaxConcurrency),
