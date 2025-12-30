@@ -8,9 +8,10 @@ import (
 )
 
 type Locale struct {
-	IsoShortCode string
-	IsoLongCode  string
-	Messages     map[MessageId]string
+	IsoShortCode       string
+	IsoLongCode        string
+	ParentIsoShortCode *string
+	Messages           map[MessageId]string
 }
 
 var LocaleEnglish = &Locale{
@@ -21,7 +22,7 @@ var LocaleEnglish = &Locale{
 var locales = make(map[string]*Locale)
 
 func Init(localePath string) error {
-	// Load English 
+	// Load English
 	if err := loadLocale(localePath, LocaleEnglish); err != nil {
 		return fmt.Errorf("failed to load English locale: %w", err)
 	}
@@ -62,7 +63,30 @@ func Init(localePath string) error {
 		locales[isoLongCode] = locale
 	}
 
+	// Set parent language relationships for sub-languages
+	setParentLanguages()
+
 	return nil
+}
+
+func setParentLanguages() {
+	// German (Switzerland) -> German
+	if locale, ok := locales["de-CH"]; ok {
+		parent := "de"
+		locale.ParentIsoShortCode = &parent
+	}
+
+	// Portuguese (Brazil) -> Portuguese
+	if locale, ok := locales["pt-BR"]; ok {
+		parent := "pt"
+		locale.ParentIsoShortCode = &parent
+	}
+
+	// Chinese (Taiwan) -> Chinese
+	if locale, ok := locales["zh-TW"]; ok {
+		parent := "cn"
+		locale.ParentIsoShortCode = &parent
+	}
 }
 
 func loadLocale(basePath string, locale *Locale) error {
@@ -153,9 +177,25 @@ func GetMessage(locale *Locale, id MessageId, format ...interface{}) string {
 	}
 
 	value, ok := locale.Messages[id]
-	if !ok || value == "" {
+
+	// Check if message exists in English
+	englishValue, englishExists := LocaleEnglish.Messages[id]
+
+	// Message is missing, empty, or same as English
+	if !ok || value == "" || (englishExists && value == englishValue) {
 		if locale == LocaleEnglish {
-			return fmt.Sprintf("error: translation for `%s` is missing", id)
+			if !ok || value == "" {
+				return fmt.Sprintf("error: translation for `%s` is missing", id)
+			}
+			return fmt.Sprintf(value, format...)
+		}
+
+		// Check if locale has a parent language
+		if locale.ParentIsoShortCode != nil {
+			parentLocale := locales[*locale.ParentIsoShortCode]
+			if parentLocale != nil {
+				return GetMessage(parentLocale, id, format...) // try parent language first
+			}
 		}
 
 		return GetMessage(LocaleEnglish, id, format...)
