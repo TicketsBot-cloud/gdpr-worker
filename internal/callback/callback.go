@@ -168,7 +168,7 @@ func (c *Callback) buildResultComponents(locale *i18n.Locale, result ResultData,
 func (c *Callback) editOriginalMessage(ctx context.Context, request gdprrelay.GDPRRequest, components []component.Component) error {
 	data := rest.WebhookEditBody{
 		Components: components,
-		Flags:      uint(message.FlagComponentsV2),
+		Flags:      uint(message.FlagIsComponentsV2),
 	}
 
 	_, err := rest.EditOriginalInteractionResponse(ctx, request.InteractionToken, c.rateLimiter, request.ApplicationId, data)
@@ -218,7 +218,7 @@ func (c *Callback) sendCompletionViaDM(ctx context.Context, request gdprrelay.GD
 
 	data := rest.CreateMessageData{
 		Components: components,
-		Flags:      uint(message.FlagComponentsV2),
+		Flags:      uint(message.FlagIsComponentsV2),
 	}
 
 	_, err = rest.CreateMessage(ctx, config.Conf.Discord.Token, c.rateLimiter, dmChannel.Id, data)
