@@ -3,40 +3,61 @@ package processor
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/TicketsBot-cloud/archiverclient"
+	"github.com/TicketsBot-cloud/common/encryption"
+	"github.com/TicketsBot-cloud/gdl/cache"
+	"github.com/TicketsBot-cloud/gdl/objects/channel/message"
 	"github.com/TicketsBot-cloud/gdl/rest"
 	"github.com/TicketsBot-cloud/gdl/rest/ratelimit"
 	"github.com/TicketsBot-cloud/gdpr-worker/internal/archiver"
 	"github.com/TicketsBot-cloud/gdpr-worker/internal/config"
 	"github.com/TicketsBot-cloud/gdpr-worker/internal/database"
+	"github.com/TicketsBot-cloud/gdpr-worker/internal/export"
 	"github.com/TicketsBot-cloud/gdpr-worker/internal/gdprrelay"
 	"github.com/TicketsBot-cloud/gdpr-worker/internal/utils"
+	"github.com/TicketsBot-cloud/logarchiver/pkg/model"
+	v1 "github.com/TicketsBot-cloud/logarchiver/pkg/model/v1"
 	v2 "github.com/TicketsBot-cloud/logarchiver/pkg/model/v2"
+	"github.com/TicketsBot-cloud/logarchiver/pkg/export/user"
+	"github.com/TicketsBot-cloud/logarchiver/pkg/s3client"
+	"github.com/jackc/pgx/v4/pgxpool"
 	"go.uber.org/zap"
+	"golang.org/x/sync/errgroup"
 )
 
-// Processor handles the execution of GDPR data deletion requests
+// Processor handles the execution of GDPR data deletion and export requests
 type Processor struct {
 	logger      *zap.Logger
 	rateLimiter *ratelimit.Ratelimiter
+	s3Client    *s3client.S3Client
+	aesKey      []byte
+	cachePool   *pgxpool.Pool
 }
 
-func New(logger *zap.Logger) *Processor {
+func New(logger *zap.Logger, s3Client *s3client.S3Client, aesKey []byte, cachePool *pgxpool.Pool) *Processor {
 	store := ratelimit.NewMemoryStore()
 	return &Processor{
 		logger:      logger,
 		rateLimiter: ratelimit.NewRateLimiter(store, 0),
+		s3Client:    s3Client,
+		aesKey:      aesKey,
+		cachePool:   cachePool,
 	}
 }
 
 // ProcessResult contains the outcome of processing a GDPR request
 type ProcessResult struct {
-	TranscriptsDeleted int   // Number of transcript archives deleted from archiver
-	MessagesDeleted    int   // Number of ticket messages deleted from database
-	Error              error // Error if the processing failed, nil on success
+	TranscriptsDeleted int    // Number of transcript archives deleted from archiver
+	MessagesDeleted    int    // Number of ticket messages deleted from database
+	Error              error  // Error if the processing failed, nil on success
+	ExportData         []byte // ZIP file bytes for export requests
+	ExportFileName     string // Suggested filename for the export archive
 }
 
 func (p *Processor) Process(ctx context.Context, request gdprrelay.GDPRRequest) ProcessResult {
@@ -49,6 +70,10 @@ func (p *Processor) Process(ctx context.Context, request gdprrelay.GDPRRequest) 
 		return p.processAllMessages(ctx, request)
 	case gdprrelay.RequestTypeSpecificMessages:
 		return p.processSpecificMessages(ctx, request)
+	case gdprrelay.RequestTypeExportGuild:
+		return p.processExportGuild(ctx, request)
+	case gdprrelay.RequestTypeExportUser:
+		return p.processExportUser(ctx, request)
 	default:
 		return ProcessResult{Error: fmt.Errorf("unknown GDPR request type: %d", request.Type)}
 	}
@@ -558,4 +583,462 @@ func (p *Processor) storeTranscript(ctx context.Context, guildId uint64, ticketI
 	}
 
 	return archiver.Client.ImportTranscript(ctx, guildId, ticketId, data)
+}
+
+// processExportGuild exports all transcript data for the specified guilds into a ZIP archive.
+func (p *Processor) processExportGuild(ctx context.Context, request gdprrelay.GDPRRequest) ProcessResult {
+	if len(request.GuildIds) == 0 {
+		return ProcessResult{Error: fmt.Errorf("no server ID provided")}
+	}
+
+	if p.s3Client == nil {
+		return ProcessResult{Error: fmt.Errorf("S3 client not configured, cannot process export")}
+	}
+
+	scrambledUserId := utils.ScrambleUserId(request.UserId)
+
+	if err := p.verifyAllGuildsOwnership(ctx, request.GuildIds, request.UserId); err != nil {
+		p.logger.Error("Guild ownership verification failed for export",
+			zap.String("scrambled_user_id", scrambledUserId),
+			zap.Error(err),
+		)
+		return ProcessResult{Error: err}
+	}
+
+	zipBuilder := export.NewZipBuilder()
+
+	for _, guildId := range request.GuildIds {
+		keys, err := p.s3Client.GetAllKeysForGuild(ctx, guildId)
+		if err != nil {
+			p.logger.Error("Failed to list S3 keys for guild export",
+				zap.Uint64("guild_id", guildId),
+				zap.String("scrambled_user_id", scrambledUserId),
+				zap.Error(err),
+			)
+			continue
+		}
+
+		if len(keys) == 0 {
+			p.logger.Info("No transcripts found for guild export",
+				zap.Uint64("guild_id", guildId),
+				zap.String("scrambled_user_id", scrambledUserId),
+			)
+			continue
+		}
+
+		// Use errgroup with bounded concurrency for parallel downloads
+		type transcriptEntry struct {
+			ticketId int
+			data     []byte
+		}
+
+		var mu sync.Mutex
+		var entries []transcriptEntry
+
+		g, gCtx := errgroup.WithContext(ctx)
+		g.SetLimit(15)
+
+		for _, key := range keys {
+			key := key
+			g.Go(func() error {
+				// Extract ticket ID from key format: {guildId}/{ticketId}
+				parts := strings.SplitN(key, "/", 2)
+				if len(parts) != 2 {
+					p.logger.Warn("Skipping S3 key with unexpected format",
+						zap.String("key", key),
+						zap.Uint64("guild_id", guildId),
+					)
+					return nil
+				}
+
+				ticketId, err := strconv.Atoi(parts[1])
+				if err != nil {
+					p.logger.Warn("Skipping S3 key with non-numeric ticket ID",
+						zap.String("key", key),
+						zap.Uint64("guild_id", guildId),
+						zap.Error(err),
+					)
+					return nil
+				}
+
+				rawData, err := p.s3Client.GetTicket(gCtx, guildId, ticketId)
+				if err != nil {
+					if errors.Is(err, s3client.ErrTicketNotFound) {
+						p.logger.Debug("Transcript not found in S3, skipping",
+							zap.Uint64("guild_id", guildId),
+							zap.Int("ticket_id", ticketId),
+						)
+						return nil
+					}
+					p.logger.Warn("Failed to download transcript from S3",
+						zap.Uint64("guild_id", guildId),
+						zap.Int("ticket_id", ticketId),
+						zap.Error(err),
+					)
+					return nil
+				}
+
+				decrypted, err := encryption.Decrypt(p.aesKey, rawData)
+				if err != nil {
+					p.logger.Warn("Failed to decrypt transcript, skipping",
+						zap.Uint64("guild_id", guildId),
+						zap.Int("ticket_id", ticketId),
+						zap.Error(err),
+					)
+					return nil
+				}
+
+				var transcript v2.Transcript
+				version := model.GetVersion(decrypted)
+				switch version {
+				case model.V1:
+					var messages []message.Message
+					if err := json.Unmarshal(decrypted, &messages); err != nil {
+						p.logger.Warn("Failed to unmarshal V1 transcript, skipping",
+							zap.Uint64("guild_id", guildId),
+							zap.Int("ticket_id", ticketId),
+							zap.Error(err),
+						)
+						return nil
+					}
+					transcript = v1.ConvertToV2(messages)
+				case model.V2:
+					if err := json.Unmarshal(decrypted, &transcript); err != nil {
+						p.logger.Warn("Failed to unmarshal V2 transcript, skipping",
+							zap.Uint64("guild_id", guildId),
+							zap.Int("ticket_id", ticketId),
+							zap.Error(err),
+						)
+						return nil
+					}
+				default:
+					p.logger.Warn("Unknown transcript version, skipping",
+						zap.Uint64("guild_id", guildId),
+						zap.Int("ticket_id", ticketId),
+						zap.Int("version", version.Int()),
+					)
+					return nil
+				}
+
+				prettyData, err := json.MarshalIndent(transcript, "", "  ")
+				if err != nil {
+					p.logger.Warn("Failed to marshal transcript for export",
+						zap.Uint64("guild_id", guildId),
+						zap.Int("ticket_id", ticketId),
+						zap.Error(err),
+					)
+					return nil
+				}
+
+				mu.Lock()
+				entries = append(entries, transcriptEntry{ticketId: ticketId, data: prettyData})
+				mu.Unlock()
+
+				return nil
+			})
+		}
+
+		if err := g.Wait(); err != nil {
+			p.logger.Error("Error during parallel transcript download",
+				zap.Uint64("guild_id", guildId),
+				zap.Error(err),
+			)
+		}
+
+		// Add all collected entries to the ZIP
+		for _, entry := range entries {
+			var fileName string
+			if len(request.GuildIds) > 1 {
+				fileName = fmt.Sprintf("%d/%d.json", guildId, entry.ticketId)
+			} else {
+				fileName = fmt.Sprintf("%d.json", entry.ticketId)
+			}
+
+			if err := zipBuilder.AddFile(fileName, entry.data); err != nil {
+				p.logger.Error("Failed to add transcript to ZIP",
+					zap.Uint64("guild_id", guildId),
+					zap.Int("ticket_id", entry.ticketId),
+					zap.Error(err),
+				)
+			}
+		}
+	}
+
+	zipData, err := zipBuilder.Close()
+	if err != nil {
+		return ProcessResult{Error: fmt.Errorf("failed to finalise export ZIP: %w", err)}
+	}
+
+	var exportFileName string
+	if len(request.GuildIds) == 1 {
+		exportFileName = fmt.Sprintf("guild_%d.zip", request.GuildIds[0])
+	} else {
+		exportFileName = "guild_export.zip"
+	}
+
+	p.logger.Info("Guild export completed",
+		zap.String("scrambled_user_id", scrambledUserId),
+		zap.String("export_file", exportFileName),
+		zap.Int("zip_size_bytes", len(zipData)),
+	)
+
+	return ProcessResult{
+		ExportData:     zipData,
+		ExportFileName: exportFileName,
+	}
+}
+
+// processExportUser exports all personal data for the requesting user into a ZIP archive.
+func (p *Processor) processExportUser(ctx context.Context, request gdprrelay.GDPRRequest) ProcessResult {
+	scrambledUserId := utils.ScrambleUserId(request.UserId)
+
+	zipBuilder := export.NewZipBuilder()
+
+	// Export database data
+	userData, err := user.GetUserData(database.Client, request.UserId)
+	if err != nil {
+		p.logger.Error("Failed to get user database data for export",
+			zap.String("scrambled_user_id", scrambledUserId),
+			zap.Error(err),
+		)
+		return ProcessResult{Error: fmt.Errorf("failed to retrieve database data: %w", err)}
+	}
+
+	dbJson, err := json.MarshalIndent(userData, "", "  ")
+	if err != nil {
+		return ProcessResult{Error: fmt.Errorf("failed to serialise database data: %w", err)}
+	}
+
+	if err := zipBuilder.AddFile("database.json", dbJson); err != nil {
+		return ProcessResult{Error: fmt.Errorf("failed to add database.json to export: %w", err)}
+	}
+
+	// Export cache data if cache pool is available
+	if p.cachePool != nil {
+		pgCache := cache.NewPgCache(p.cachePool, cache.CacheOptions{
+			Users:   true,
+			Members: true,
+		})
+
+		cacheData, err := user.GetCacheData(&pgCache, request.UserId)
+		if err != nil {
+			p.logger.Warn("Failed to get user cache data for export, continuing without it",
+				zap.String("scrambled_user_id", scrambledUserId),
+				zap.Error(err),
+			)
+		} else {
+			cacheJson, err := json.MarshalIndent(cacheData, "", "  ")
+			if err != nil {
+				p.logger.Warn("Failed to serialise cache data",
+					zap.String("scrambled_user_id", scrambledUserId),
+					zap.Error(err),
+				)
+			} else {
+				if err := zipBuilder.AddFile("cache.json", cacheJson); err != nil {
+					p.logger.Warn("Failed to add cache.json to export",
+						zap.String("scrambled_user_id", scrambledUserId),
+						zap.Error(err),
+					)
+				}
+			}
+		}
+	}
+
+	// Collect all ticket IDs where the user participated or is the creator
+	transcriptIds := make(map[uint64][]int)
+
+	// Query tickets where user is a participant
+	{
+		query := `SELECT participant.guild_id, participant.ticket_id FROM participant INNER JOIN tickets ON participant.guild_id = tickets.guild_id AND tickets.id = participant.ticket_id WHERE participant.user_id = $1 AND tickets.has_transcript='t' AND tickets.open='f';`
+		rows, err := database.Client.Participants.Query(ctx, query, request.UserId)
+		if err != nil {
+			p.logger.Error("Failed to query participant tickets for user export",
+				zap.String("scrambled_user_id", scrambledUserId),
+				zap.Error(err),
+			)
+			return ProcessResult{Error: fmt.Errorf("failed to query participant tickets: %w", err)}
+		}
+
+		for rows.Next() {
+			var guildId uint64
+			var ticketId int
+			if err := rows.Scan(&guildId, &ticketId); err != nil {
+				p.logger.Warn("Failed to scan participant ticket row",
+					zap.String("scrambled_user_id", scrambledUserId),
+					zap.Error(err),
+				)
+				continue
+			}
+			transcriptIds[guildId] = append(transcriptIds[guildId], ticketId)
+		}
+		rows.Close()
+	}
+
+	// Query tickets where user is the creator
+	{
+		query := `SELECT guild_id, id FROM tickets WHERE user_id = $1 AND has_transcript='t' AND open='f';`
+		rows, err := database.Client.Tickets.Query(ctx, query, request.UserId)
+		if err != nil {
+			p.logger.Error("Failed to query user-created tickets for export",
+				zap.String("scrambled_user_id", scrambledUserId),
+				zap.Error(err),
+			)
+			return ProcessResult{Error: fmt.Errorf("failed to query user tickets: %w", err)}
+		}
+
+		for rows.Next() {
+			var guildId uint64
+			var ticketId int
+			if err := rows.Scan(&guildId, &ticketId); err != nil {
+				p.logger.Warn("Failed to scan user ticket row",
+					zap.String("scrambled_user_id", scrambledUserId),
+					zap.Error(err),
+				)
+				continue
+			}
+			transcriptIds[guildId] = append(transcriptIds[guildId], ticketId)
+		}
+		rows.Close()
+	}
+
+	// Deduplicate ticket IDs per guild
+	for guildId, ticketIds := range transcriptIds {
+		seen := make(map[int]struct{})
+		deduped := make([]int, 0, len(ticketIds))
+		for _, id := range ticketIds {
+			if _, exists := seen[id]; !exists {
+				seen[id] = struct{}{}
+				deduped = append(deduped, id)
+			}
+		}
+		transcriptIds[guildId] = deduped
+	}
+
+	// Download, decrypt, filter and add transcripts to ZIP
+	if p.s3Client != nil {
+		for guildId, ticketIds := range transcriptIds {
+			for _, ticketId := range ticketIds {
+				rawData, err := p.s3Client.GetTicket(ctx, guildId, ticketId)
+				if err != nil {
+					if errors.Is(err, s3client.ErrTicketNotFound) {
+						p.logger.Debug("Transcript not found for user export, skipping",
+							zap.Uint64("guild_id", guildId),
+							zap.Int("ticket_id", ticketId),
+						)
+						continue
+					}
+					p.logger.Warn("Failed to download transcript for user export",
+						zap.Uint64("guild_id", guildId),
+						zap.Int("ticket_id", ticketId),
+						zap.Error(err),
+					)
+					continue
+				}
+
+				decrypted, err := encryption.Decrypt(p.aesKey, rawData)
+				if err != nil {
+					p.logger.Warn("Failed to decrypt transcript for user export, skipping",
+						zap.Uint64("guild_id", guildId),
+						zap.Int("ticket_id", ticketId),
+						zap.Error(err),
+					)
+					continue
+				}
+
+				var transcript v2.Transcript
+				version := model.GetVersion(decrypted)
+				switch version {
+				case model.V1:
+					var messages []message.Message
+					if err := json.Unmarshal(decrypted, &messages); err != nil {
+						p.logger.Warn("Failed to unmarshal V1 transcript for user export, skipping",
+							zap.Uint64("guild_id", guildId),
+							zap.Int("ticket_id", ticketId),
+							zap.Error(err),
+						)
+						continue
+					}
+					transcript = v1.ConvertToV2(messages)
+				case model.V2:
+					if err := json.Unmarshal(decrypted, &transcript); err != nil {
+						p.logger.Warn("Failed to unmarshal V2 transcript for user export, skipping",
+							zap.Uint64("guild_id", guildId),
+							zap.Int("ticket_id", ticketId),
+							zap.Error(err),
+						)
+						continue
+					}
+				default:
+					p.logger.Warn("Unknown transcript version for user export, skipping",
+						zap.Uint64("guild_id", guildId),
+						zap.Int("ticket_id", ticketId),
+						zap.Int("version", version.Int()),
+					)
+					continue
+				}
+
+				// Filter to only the user's data
+				transcript.Entities.Channels = nil
+				transcript.Entities.Roles = nil
+
+				userEntity, ok := transcript.Entities.Users[request.UserId]
+				if !ok {
+					transcript.Entities.Users = nil
+				} else {
+					transcript.Entities.Users = map[uint64]v2.User{
+						userEntity.Id: userEntity,
+					}
+				}
+
+				var filteredMessages []v2.Message
+				for _, msg := range transcript.Messages {
+					if msg.AuthorId == request.UserId {
+						filteredMessages = append(filteredMessages, msg)
+					}
+				}
+				transcript.Messages = filteredMessages
+
+				prettyData, err := json.MarshalIndent(transcript, "", "  ")
+				if err != nil {
+					p.logger.Warn("Failed to marshal filtered transcript for user export",
+						zap.Uint64("guild_id", guildId),
+						zap.Int("ticket_id", ticketId),
+						zap.Error(err),
+					)
+					continue
+				}
+
+				fileName := fmt.Sprintf("transcripts/%d-%d.json", guildId, ticketId)
+				if err := zipBuilder.AddFile(fileName, prettyData); err != nil {
+					p.logger.Error("Failed to add transcript to user export ZIP",
+						zap.Uint64("guild_id", guildId),
+						zap.Int("ticket_id", ticketId),
+						zap.Error(err),
+					)
+				}
+			}
+		}
+	} else {
+		p.logger.Warn("S3 client not configured, skipping transcript export for user",
+			zap.String("scrambled_user_id", scrambledUserId),
+		)
+	}
+
+	zipData, err := zipBuilder.Close()
+	if err != nil {
+		return ProcessResult{Error: fmt.Errorf("failed to finalise user export ZIP: %w", err)}
+	}
+
+	exportFileName := fmt.Sprintf("user_%d.zip", request.UserId)
+
+	p.logger.Info("User export completed",
+		zap.String("scrambled_user_id", scrambledUserId),
+		zap.String("export_file", exportFileName),
+		zap.Int("zip_size_bytes", len(zipData)),
+	)
+
+	return ProcessResult{
+		ExportData:     zipData,
+		ExportFileName: exportFileName,
+	}
 }

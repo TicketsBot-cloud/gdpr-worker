@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"os/signal"
 	"syscall"
@@ -16,7 +17,11 @@ import (
 	"github.com/TicketsBot-cloud/gdpr-worker/internal/heartbeat"
 	"github.com/TicketsBot-cloud/gdpr-worker/internal/processor"
 	"github.com/TicketsBot-cloud/gdpr-worker/internal/utils"
+	"github.com/TicketsBot-cloud/logarchiver/pkg/s3client"
 	"github.com/go-redis/redis/v8"
+	"github.com/jackc/pgx/v4/pgxpool"
+	"github.com/minio/minio-go/v7"
+	"github.com/minio/minio-go/v7/pkg/credentials"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 
@@ -61,14 +66,57 @@ func main() {
 		return
 	}
 
-	logger.Info("Initializing archiver client")
+	logger.Info("Initialising archiver client")
 	archiver.Initialize(
 		logger.With(),
 		config.Conf.Archiver.Url,
 		config.Conf.Archiver.AesKey,
 	)
 
-	proc := processor.New(logger.With())
+	// Initialise S3 client for export operations
+	var s3Client *s3client.S3Client
+	if config.Conf.S3.Endpoint != "" {
+		logger.Info("Initialising S3 client")
+		minioClient, err := minio.New(config.Conf.S3.Endpoint, &minio.Options{
+			Creds:  credentials.NewStaticV4(config.Conf.S3.AccessKey, config.Conf.S3.SecretKey, ""),
+			Secure: config.Conf.S3.Secure,
+		})
+		if err != nil {
+			logger.Fatal("Failed to initialise S3 client", zap.Error(err))
+			return
+		}
+		s3Client = s3client.NewS3Client(minioClient, config.Conf.S3.Bucket)
+		logger.Info("S3 client initialised")
+	} else {
+		logger.Warn("S3 not configured, export features will be unavailable")
+	}
+
+	// Initialise cache database connection for user export operations
+	var cachePool *pgxpool.Pool
+	if config.Conf.CacheDatabase.Host != "" {
+		logger.Info("Connecting to cache database")
+		cacheUri := fmt.Sprintf("postgres://%s:%s@%s/%s?pool_max_conns=%d",
+			config.Conf.CacheDatabase.Username,
+			config.Conf.CacheDatabase.Password,
+			config.Conf.CacheDatabase.Host,
+			config.Conf.CacheDatabase.Database,
+			config.Conf.CacheDatabase.Threads,
+		)
+
+		var err error
+		cachePool, err = pgxpool.Connect(context.Background(), cacheUri)
+		if err != nil {
+			logger.Fatal("Failed to connect to cache database", zap.Error(err))
+			return
+		}
+		logger.Info("Connected to cache database")
+	} else {
+		logger.Warn("Cache database not configured, user export cache data will be unavailable")
+	}
+
+	aesKey := []byte(config.Conf.Archiver.AesKey)
+
+	proc := processor.New(logger.With(), s3Client, aesKey, cachePool)
 
 	callbackHandler := callback.New(
 		logger.With(),
@@ -142,12 +190,14 @@ func main() {
 				}
 
 				callbackData := callback.ResultData{
-					TranscriptsDeleted:    result.TranscriptsDeleted,
-					MessagesDeleted: result.MessagesDeleted,
-					Error:           result.Error,
-					RequestType:     req.Request.Type,
-					GuildIds:        req.Request.GuildIds,
-					TicketIds:       req.Request.TicketIds,
+					TranscriptsDeleted: result.TranscriptsDeleted,
+					MessagesDeleted:    result.MessagesDeleted,
+					Error:              result.Error,
+					RequestType:        req.Request.Type,
+					GuildIds:           req.Request.GuildIds,
+					TicketIds:          req.Request.TicketIds,
+					ExportData:         result.ExportData,
+					ExportFileName:     result.ExportFileName,
 				}
 
 				callbackCtx, callbackCancel := context.WithTimeout(context.Background(), 30*time.Second)
