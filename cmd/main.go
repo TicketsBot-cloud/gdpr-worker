@@ -17,11 +17,8 @@ import (
 	"github.com/TicketsBot-cloud/gdpr-worker/internal/heartbeat"
 	"github.com/TicketsBot-cloud/gdpr-worker/internal/processor"
 	"github.com/TicketsBot-cloud/gdpr-worker/internal/utils"
-	"github.com/TicketsBot-cloud/logarchiver/pkg/s3client"
 	"github.com/go-redis/redis/v8"
 	"github.com/jackc/pgx/v4/pgxpool"
-	"github.com/minio/minio-go/v7"
-	"github.com/minio/minio-go/v7/pkg/credentials"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 
@@ -73,24 +70,6 @@ func main() {
 		config.Conf.Archiver.AesKey,
 	)
 
-	// Initialise S3 client for export operations
-	var s3Client *s3client.S3Client
-	if config.Conf.S3.Endpoint != "" {
-		logger.Info("Initialising S3 client")
-		minioClient, err := minio.New(config.Conf.S3.Endpoint, &minio.Options{
-			Creds:  credentials.NewStaticV4(config.Conf.S3.AccessKey, config.Conf.S3.SecretKey, ""),
-			Secure: config.Conf.S3.Secure,
-		})
-		if err != nil {
-			logger.Fatal("Failed to initialise S3 client", zap.Error(err))
-			return
-		}
-		s3Client = s3client.NewS3Client(minioClient, config.Conf.S3.Bucket)
-		logger.Info("S3 client initialised")
-	} else {
-		logger.Warn("S3 not configured, export features will be unavailable")
-	}
-
 	// Initialise cache database connection for user export operations
 	var cachePool *pgxpool.Pool
 	if config.Conf.CacheDatabase.Host != "" {
@@ -114,9 +93,7 @@ func main() {
 		logger.Warn("Cache database not configured, user export cache data will be unavailable")
 	}
 
-	aesKey := []byte(config.Conf.Archiver.AesKey)
-
-	proc := processor.New(logger.With(), s3Client, aesKey, cachePool)
+	proc := processor.New(logger.With(), cachePool)
 
 	callbackHandler := callback.New(
 		logger.With(),

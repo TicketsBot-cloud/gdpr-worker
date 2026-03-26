@@ -3,16 +3,12 @@ package processor
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
-	"strconv"
 	"strings"
 	"sync"
 
 	"github.com/TicketsBot-cloud/archiverclient"
-	"github.com/TicketsBot-cloud/common/encryption"
 	"github.com/TicketsBot-cloud/gdl/cache"
-	"github.com/TicketsBot-cloud/gdl/objects/channel/message"
 	"github.com/TicketsBot-cloud/gdl/rest"
 	"github.com/TicketsBot-cloud/gdl/rest/ratelimit"
 	"github.com/TicketsBot-cloud/gdpr-worker/internal/archiver"
@@ -21,11 +17,8 @@ import (
 	"github.com/TicketsBot-cloud/gdpr-worker/internal/export"
 	"github.com/TicketsBot-cloud/gdpr-worker/internal/gdprrelay"
 	"github.com/TicketsBot-cloud/gdpr-worker/internal/utils"
-	"github.com/TicketsBot-cloud/logarchiver/pkg/model"
-	v1 "github.com/TicketsBot-cloud/logarchiver/pkg/model/v1"
 	v2 "github.com/TicketsBot-cloud/logarchiver/pkg/model/v2"
 	"github.com/TicketsBot-cloud/logarchiver/pkg/export/user"
-	"github.com/TicketsBot-cloud/logarchiver/pkg/s3client"
 	"github.com/jackc/pgx/v4/pgxpool"
 	"go.uber.org/zap"
 	"golang.org/x/sync/errgroup"
@@ -35,18 +28,14 @@ import (
 type Processor struct {
 	logger      *zap.Logger
 	rateLimiter *ratelimit.Ratelimiter
-	s3Client    *s3client.S3Client
-	aesKey      []byte
 	cachePool   *pgxpool.Pool
 }
 
-func New(logger *zap.Logger, s3Client *s3client.S3Client, aesKey []byte, cachePool *pgxpool.Pool) *Processor {
+func New(logger *zap.Logger, cachePool *pgxpool.Pool) *Processor {
 	store := ratelimit.NewMemoryStore()
 	return &Processor{
 		logger:      logger,
 		rateLimiter: ratelimit.NewRateLimiter(store, 0),
-		s3Client:    s3Client,
-		aesKey:      aesKey,
 		cachePool:   cachePool,
 	}
 }
@@ -591,10 +580,6 @@ func (p *Processor) processExportGuild(ctx context.Context, request gdprrelay.GD
 		return ProcessResult{Error: fmt.Errorf("no server ID provided")}
 	}
 
-	if p.s3Client == nil {
-		return ProcessResult{Error: fmt.Errorf("S3 client not configured, cannot process export")}
-	}
-
 	scrambledUserId := utils.ScrambleUserId(request.UserId)
 
 	if err := p.verifyAllGuildsOwnership(ctx, request.GuildIds, request.UserId); err != nil {
@@ -608,9 +593,10 @@ func (p *Processor) processExportGuild(ctx context.Context, request gdprrelay.GD
 	zipBuilder := export.NewZipBuilder()
 
 	for _, guildId := range request.GuildIds {
-		keys, err := p.s3Client.GetAllKeysForGuild(ctx, guildId)
+		query := `SELECT id FROM tickets WHERE guild_id = $1 AND has_transcript = 't' AND open = 'f' ORDER BY id;`
+		rows, err := database.Client.Tickets.Query(ctx, query, guildId)
 		if err != nil {
-			p.logger.Error("Failed to list S3 keys for guild export",
+			p.logger.Error("Failed to query tickets for guild export",
 				zap.Uint64("guild_id", guildId),
 				zap.String("scrambled_user_id", scrambledUserId),
 				zap.Error(err),
@@ -618,7 +604,21 @@ func (p *Processor) processExportGuild(ctx context.Context, request gdprrelay.GD
 			continue
 		}
 
-		if len(keys) == 0 {
+		var ticketIds []int
+		for rows.Next() {
+			var id int
+			if err := rows.Scan(&id); err != nil {
+				p.logger.Warn("Failed to scan ticket ID for guild export",
+					zap.Uint64("guild_id", guildId),
+					zap.Error(err),
+				)
+				continue
+			}
+			ticketIds = append(ticketIds, id)
+		}
+		rows.Close()
+
+		if len(ticketIds) == 0 {
 			p.logger.Info("No transcripts found for guild export",
 				zap.Uint64("guild_id", guildId),
 				zap.String("scrambled_user_id", scrambledUserId),
@@ -638,84 +638,22 @@ func (p *Processor) processExportGuild(ctx context.Context, request gdprrelay.GD
 		g, gCtx := errgroup.WithContext(ctx)
 		g.SetLimit(15)
 
-		for _, key := range keys {
-			key := key
+		for _, ticketId := range ticketIds {
+			ticketId := ticketId
 			g.Go(func() error {
-				// Extract ticket ID from key format: {guildId}/{ticketId}
-				parts := strings.SplitN(key, "/", 2)
-				if len(parts) != 2 {
-					p.logger.Warn("Skipping S3 key with unexpected format",
-						zap.String("key", key),
-						zap.Uint64("guild_id", guildId),
-					)
-					return nil
-				}
-
-				ticketId, err := strconv.Atoi(parts[1])
+				transcript, err := archiver.Client.Get(gCtx, guildId, ticketId)
 				if err != nil {
-					p.logger.Warn("Skipping S3 key with non-numeric ticket ID",
-						zap.String("key", key),
-						zap.Uint64("guild_id", guildId),
-						zap.Error(err),
-					)
-					return nil
-				}
-
-				rawData, err := p.s3Client.GetTicket(gCtx, guildId, ticketId)
-				if err != nil {
-					if errors.Is(err, s3client.ErrTicketNotFound) {
-						p.logger.Debug("Transcript not found in S3, skipping",
+					if err == archiverclient.ErrNotFound {
+						p.logger.Debug("Transcript not found in archiver, skipping",
 							zap.Uint64("guild_id", guildId),
 							zap.Int("ticket_id", ticketId),
 						)
 						return nil
 					}
-					p.logger.Warn("Failed to download transcript from S3",
+					p.logger.Warn("Failed to download transcript from archiver",
 						zap.Uint64("guild_id", guildId),
 						zap.Int("ticket_id", ticketId),
 						zap.Error(err),
-					)
-					return nil
-				}
-
-				decrypted, err := encryption.Decrypt(p.aesKey, rawData)
-				if err != nil {
-					p.logger.Warn("Failed to decrypt transcript, skipping",
-						zap.Uint64("guild_id", guildId),
-						zap.Int("ticket_id", ticketId),
-						zap.Error(err),
-					)
-					return nil
-				}
-
-				var transcript v2.Transcript
-				version := model.GetVersion(decrypted)
-				switch version {
-				case model.V1:
-					var messages []message.Message
-					if err := json.Unmarshal(decrypted, &messages); err != nil {
-						p.logger.Warn("Failed to unmarshal V1 transcript, skipping",
-							zap.Uint64("guild_id", guildId),
-							zap.Int("ticket_id", ticketId),
-							zap.Error(err),
-						)
-						return nil
-					}
-					transcript = v1.ConvertToV2(messages)
-				case model.V2:
-					if err := json.Unmarshal(decrypted, &transcript); err != nil {
-						p.logger.Warn("Failed to unmarshal V2 transcript, skipping",
-							zap.Uint64("guild_id", guildId),
-							zap.Int("ticket_id", ticketId),
-							zap.Error(err),
-						)
-						return nil
-					}
-				default:
-					p.logger.Warn("Unknown transcript version, skipping",
-						zap.Uint64("guild_id", guildId),
-						zap.Int("ticket_id", ticketId),
-						zap.Int("version", version.Int()),
 					)
 					return nil
 				}
@@ -914,114 +852,66 @@ func (p *Processor) processExportUser(ctx context.Context, request gdprrelay.GDP
 		transcriptIds[guildId] = deduped
 	}
 
-	// Download, decrypt, filter and add transcripts to ZIP
-	if p.s3Client != nil {
-		for guildId, ticketIds := range transcriptIds {
-			for _, ticketId := range ticketIds {
-				rawData, err := p.s3Client.GetTicket(ctx, guildId, ticketId)
-				if err != nil {
-					if errors.Is(err, s3client.ErrTicketNotFound) {
-						p.logger.Debug("Transcript not found for user export, skipping",
-							zap.Uint64("guild_id", guildId),
-							zap.Int("ticket_id", ticketId),
-						)
-						continue
-					}
-					p.logger.Warn("Failed to download transcript for user export",
+	// Download, filter and add transcripts to ZIP
+	for guildId, ticketIds := range transcriptIds {
+		for _, ticketId := range ticketIds {
+			transcript, err := archiver.Client.Get(ctx, guildId, ticketId)
+			if err != nil {
+				if err == archiverclient.ErrNotFound {
+					p.logger.Debug("Transcript not found for user export, skipping",
 						zap.Uint64("guild_id", guildId),
 						zap.Int("ticket_id", ticketId),
-						zap.Error(err),
 					)
 					continue
 				}
+				p.logger.Warn("Failed to download transcript for user export",
+					zap.Uint64("guild_id", guildId),
+					zap.Int("ticket_id", ticketId),
+					zap.Error(err),
+				)
+				continue
+			}
 
-				decrypted, err := encryption.Decrypt(p.aesKey, rawData)
-				if err != nil {
-					p.logger.Warn("Failed to decrypt transcript for user export, skipping",
-						zap.Uint64("guild_id", guildId),
-						zap.Int("ticket_id", ticketId),
-						zap.Error(err),
-					)
-					continue
-				}
+			// Filter to only the user's data
+			transcript.Entities.Channels = nil
+			transcript.Entities.Roles = nil
 
-				var transcript v2.Transcript
-				version := model.GetVersion(decrypted)
-				switch version {
-				case model.V1:
-					var messages []message.Message
-					if err := json.Unmarshal(decrypted, &messages); err != nil {
-						p.logger.Warn("Failed to unmarshal V1 transcript for user export, skipping",
-							zap.Uint64("guild_id", guildId),
-							zap.Int("ticket_id", ticketId),
-							zap.Error(err),
-						)
-						continue
-					}
-					transcript = v1.ConvertToV2(messages)
-				case model.V2:
-					if err := json.Unmarshal(decrypted, &transcript); err != nil {
-						p.logger.Warn("Failed to unmarshal V2 transcript for user export, skipping",
-							zap.Uint64("guild_id", guildId),
-							zap.Int("ticket_id", ticketId),
-							zap.Error(err),
-						)
-						continue
-					}
-				default:
-					p.logger.Warn("Unknown transcript version for user export, skipping",
-						zap.Uint64("guild_id", guildId),
-						zap.Int("ticket_id", ticketId),
-						zap.Int("version", version.Int()),
-					)
-					continue
-				}
-
-				// Filter to only the user's data
-				transcript.Entities.Channels = nil
-				transcript.Entities.Roles = nil
-
-				userEntity, ok := transcript.Entities.Users[request.UserId]
-				if !ok {
-					transcript.Entities.Users = nil
-				} else {
-					transcript.Entities.Users = map[uint64]v2.User{
-						userEntity.Id: userEntity,
-					}
-				}
-
-				var filteredMessages []v2.Message
-				for _, msg := range transcript.Messages {
-					if msg.AuthorId == request.UserId {
-						filteredMessages = append(filteredMessages, msg)
-					}
-				}
-				transcript.Messages = filteredMessages
-
-				prettyData, err := json.MarshalIndent(transcript, "", "  ")
-				if err != nil {
-					p.logger.Warn("Failed to marshal filtered transcript for user export",
-						zap.Uint64("guild_id", guildId),
-						zap.Int("ticket_id", ticketId),
-						zap.Error(err),
-					)
-					continue
-				}
-
-				fileName := fmt.Sprintf("transcripts/%d-%d.json", guildId, ticketId)
-				if err := zipBuilder.AddFile(fileName, prettyData); err != nil {
-					p.logger.Error("Failed to add transcript to user export ZIP",
-						zap.Uint64("guild_id", guildId),
-						zap.Int("ticket_id", ticketId),
-						zap.Error(err),
-					)
+			userEntity, ok := transcript.Entities.Users[request.UserId]
+			if !ok {
+				transcript.Entities.Users = nil
+			} else {
+				transcript.Entities.Users = map[uint64]v2.User{
+					userEntity.Id: userEntity,
 				}
 			}
+
+			var filteredMessages []v2.Message
+			for _, msg := range transcript.Messages {
+				if msg.AuthorId == request.UserId {
+					filteredMessages = append(filteredMessages, msg)
+				}
+			}
+			transcript.Messages = filteredMessages
+
+			prettyData, err := json.MarshalIndent(transcript, "", "  ")
+			if err != nil {
+				p.logger.Warn("Failed to marshal filtered transcript for user export",
+					zap.Uint64("guild_id", guildId),
+					zap.Int("ticket_id", ticketId),
+					zap.Error(err),
+				)
+				continue
+			}
+
+			fileName := fmt.Sprintf("transcripts/%d-%d.json", guildId, ticketId)
+			if err := zipBuilder.AddFile(fileName, prettyData); err != nil {
+				p.logger.Error("Failed to add transcript to user export ZIP",
+					zap.Uint64("guild_id", guildId),
+					zap.Int("ticket_id", ticketId),
+					zap.Error(err),
+				)
+			}
 		}
-	} else {
-		p.logger.Warn("S3 client not configured, skipping transcript export for user",
-			zap.String("scrambled_user_id", scrambledUserId),
-		)
 	}
 
 	zipData, err := zipBuilder.Close()
