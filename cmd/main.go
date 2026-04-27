@@ -142,12 +142,12 @@ func main() {
 				}
 
 				callbackData := callback.ResultData{
-					TranscriptsDeleted:    result.TranscriptsDeleted,
-					MessagesDeleted: result.MessagesDeleted,
-					Error:           result.Error,
-					RequestType:     req.Request.Type,
-					GuildIds:        req.Request.GuildIds,
-					TicketIds:       req.Request.TicketIds,
+					TranscriptsDeleted: result.TranscriptsDeleted,
+					MessagesDeleted:    result.MessagesDeleted,
+					Error:              result.Error,
+					RequestType:        req.Request.Type,
+					GuildIds:           req.Request.GuildIds,
+					TicketIds:          req.Request.TicketIds,
 				}
 
 				callbackCtx, callbackCancel := context.WithTimeout(context.Background(), 30*time.Second)

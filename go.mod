@@ -4,11 +4,11 @@ go 1.24.0
 
 //replace github.com/TicketsBot-cloud/database => ../database
 
-//replace github.com/TicketsBot-cloud/gdl => ../gdl
+replace github.com/TicketsBot-cloud/gdl => ../gdl
 
-//replace github.com/TicketsBot-cloud/archiverclient => ./archiverclient
+//replace github.com/TicketsBot-cloud/archiverclient => ../archiverclient
 
-//replace github.com/TicketsBot-cloud/logarchiver => ../logarchiver
+replace github.com/TicketsBot-cloud/logarchiver => ../logarchiver
 
 require (
 	github.com/TicketsBot-cloud/archiverclient v0.0.0-20251015181023-f0b66a074704

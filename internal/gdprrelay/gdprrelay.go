@@ -6,8 +6,8 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/TicketsBot-cloud/gdpr-worker/internal/utils"
 	"github.com/TicketsBot-cloud/gdpr-worker/internal/config"
+	"github.com/TicketsBot-cloud/gdpr-worker/internal/utils"
 	"github.com/go-redis/redis/v8"
 	"go.uber.org/zap"
 )
