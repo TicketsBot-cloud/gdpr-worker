@@ -2,8 +2,8 @@ package utils
 
 import (
 	"crypto/sha256"
-	"strconv"
 	"fmt"
+	"strconv"
 
 	"github.com/TicketsBot-cloud/gdl/objects/interaction/component"
 )

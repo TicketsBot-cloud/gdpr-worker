@@ -9,10 +9,10 @@ import (
 	"github.com/TicketsBot-cloud/gdl/objects/interaction/component"
 	"github.com/TicketsBot-cloud/gdl/rest"
 	"github.com/TicketsBot-cloud/gdl/rest/ratelimit"
+	"github.com/TicketsBot-cloud/gdpr-worker/i18n"
 	"github.com/TicketsBot-cloud/gdpr-worker/internal/config"
 	"github.com/TicketsBot-cloud/gdpr-worker/internal/gdprrelay"
 	"github.com/TicketsBot-cloud/gdpr-worker/internal/utils"
-	"github.com/TicketsBot-cloud/gdpr-worker/i18n"
 	"go.uber.org/zap"
 )
 

@@ -6,10 +6,10 @@ import (
 )
 
 type Config struct {
-	JsonLogs        bool          `env:"JSON_LOGS" envDefault:"false"`
-	LogLevel        zapcore.Level `env:"LOG_LEVEL" envDefault:"info"`
-	MaxConcurrency  int           `env:"MAX_CONCURRENCY" envDefault:"1"`
-	MaxRetries      int           `env:"MAX_RETRIES" envDefault:"3"`
+	JsonLogs       bool          `env:"JSON_LOGS" envDefault:"false"`
+	LogLevel       zapcore.Level `env:"LOG_LEVEL" envDefault:"info"`
+	MaxConcurrency int           `env:"MAX_CONCURRENCY" envDefault:"1"`
+	MaxRetries     int           `env:"MAX_RETRIES" envDefault:"3"`
 
 	Database struct {
 		Host     string `env:"HOST"`

@@ -10,8 +10,8 @@ import (
 
 const (
 	HeartbeatKey      = "tickets:gdpr:worker:heartbeat" // Redis key for storing the heartbeat timestamp
-	HeartbeatInterval = 10 * time.Second                 // How often to send heartbeat updates
-	HeartbeatTTL      = 30 * time.Second                 // How long before the heartbeat expires if not refreshed
+	HeartbeatInterval = 10 * time.Second                // How often to send heartbeat updates
+	HeartbeatTTL      = 30 * time.Second                // How long before the heartbeat expires if not refreshed
 )
 
 func Start(ctx context.Context, redisClient *redis.Client, logger *zap.Logger) {
