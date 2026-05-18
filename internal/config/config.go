@@ -6,10 +6,10 @@ import (
 )
 
 type Config struct {
-	JsonLogs        bool          `env:"JSON_LOGS" envDefault:"false"`
-	LogLevel        zapcore.Level `env:"LOG_LEVEL" envDefault:"info"`
-	MaxConcurrency  int           `env:"MAX_CONCURRENCY" envDefault:"1"`
-	MaxRetries      int           `env:"MAX_RETRIES" envDefault:"3"`
+	JsonLogs       bool          `env:"JSON_LOGS" envDefault:"false"`
+	LogLevel       zapcore.Level `env:"LOG_LEVEL" envDefault:"info"`
+	MaxConcurrency int           `env:"MAX_CONCURRENCY" envDefault:"1"`
+	MaxRetries     int           `env:"MAX_RETRIES" envDefault:"3"`
 
 	Database struct {
 		Host     string `env:"HOST"`
@@ -34,6 +34,22 @@ type Config struct {
 		ProxyUrl string `env:"PROXY_URL"`
 		Token    string `env:"TOKEN"`
 	} `envPrefix:"DISCORD_"`
+
+	S3 struct {
+		Endpoint  string `env:"ENDPOINT"`
+		AccessKey string `env:"ACCESS_KEY"`
+		SecretKey string `env:"SECRET_KEY"`
+		Bucket    string `env:"BUCKET"`
+		Secure    bool   `env:"SECURE" envDefault:"true"`
+	} `envPrefix:"S3_"`
+
+	CacheDatabase struct {
+		Host     string `env:"HOST"`
+		Database string `env:"NAME"`
+		Username string `env:"USER"`
+		Password string `env:"PASSWORD"`
+		Threads  int    `env:"THREADS"`
+	} `envPrefix:"CACHE_"`
 }
 
 var Conf Config

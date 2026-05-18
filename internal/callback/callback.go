@@ -1,6 +1,7 @@
 package callback
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"strings"
@@ -9,10 +10,11 @@ import (
 	"github.com/TicketsBot-cloud/gdl/objects/interaction/component"
 	"github.com/TicketsBot-cloud/gdl/rest"
 	"github.com/TicketsBot-cloud/gdl/rest/ratelimit"
+	"github.com/TicketsBot-cloud/gdl/rest/request"
+	"github.com/TicketsBot-cloud/gdpr-worker/i18n"
 	"github.com/TicketsBot-cloud/gdpr-worker/internal/config"
 	"github.com/TicketsBot-cloud/gdpr-worker/internal/gdprrelay"
 	"github.com/TicketsBot-cloud/gdpr-worker/internal/utils"
-	"github.com/TicketsBot-cloud/gdpr-worker/i18n"
 	"go.uber.org/zap"
 )
 
@@ -24,6 +26,8 @@ type ResultData struct {
 	RequestType        gdprrelay.RequestType // Type of GDPR request that was processed
 	GuildIds           []uint64              // Guild IDs affected by this request
 	TicketIds          []int                 // Ticket IDs affected by this request
+	ExportData         []byte                // ZIP file bytes for export requests
+	ExportFileName     string                // Suggested filename for the export archive
 }
 
 type Callback struct {
@@ -67,6 +71,19 @@ func (c *Callback) SendCompletion(ctx context.Context, request gdprrelay.GDPRReq
 			zap.String("scrambled_user_id", scrambledUserId),
 		)
 		return err
+	}
+
+	// For export types, send the ZIP file via DM
+	isExportType := request.Type == gdprrelay.RequestTypeExportGuild || request.Type == gdprrelay.RequestTypeExportUser
+	if isExportType && result.Error == nil && len(result.ExportData) > 0 {
+		if err := c.sendExportViaDM(ctx, request, locale, result); err != nil {
+			c.logger.Error("Failed to send export via DM",
+				zap.Error(err),
+				zap.String("scrambled_user_id", scrambledUserId),
+			)
+			return err
+		}
+		return nil
 	}
 
 	if err := c.sendEphemeralFollowup(ctx, request, locale, result); err != nil {
@@ -139,6 +156,21 @@ func (c *Callback) buildResultMessage(locale *i18n.Locale, result ResultData, gu
 		} else {
 			content = i18n.GetMessage(locale, i18n.GdprCompletedSpecificMessages, "Unknown", result.MessagesDeleted)
 		}
+
+	case gdprrelay.RequestTypeExportGuild:
+		if len(result.GuildIds) == 1 {
+			guildDisplay := utils.FormatGuildDisplay(result.GuildIds[0], guildNames)
+			content = i18n.GetMessage(locale, i18n.GdprCompletedExportGuild, guildDisplay)
+		} else {
+			guildDisplays := make([]string, len(result.GuildIds))
+			for idx, guildId := range result.GuildIds {
+				guildDisplays[idx] = utils.FormatGuildDisplay(guildId, guildNames)
+			}
+			content = i18n.GetMessage(locale, i18n.GdprCompletedExportGuildMulti, strings.Join(guildDisplays, "\n* "))
+		}
+
+	case gdprrelay.RequestTypeExportUser:
+		content = i18n.GetMessage(locale, i18n.GdprCompletedExportUser)
 	}
 
 	if result.Error != nil {
@@ -230,6 +262,61 @@ func (c *Callback) sendCompletionViaDM(ctx context.Context, request gdprrelay.GD
 		)
 		return fmt.Errorf("failed to send DM message: %w", err)
 	}
+
+	return nil
+}
+
+// sendExportViaDM sends the data export ZIP file to the user via a direct message.
+func (c *Callback) sendExportViaDM(ctx context.Context, req gdprrelay.GDPRRequest, locale *i18n.Locale, result ResultData) error {
+	scrambledUserId := utils.ScrambleUserId(req.UserId)
+
+	if config.Conf.Discord.Token == "" {
+		c.logger.Error("Discord token not configured, cannot send export DM",
+			zap.String("scrambled_user_id", scrambledUserId),
+		)
+		return fmt.Errorf("discord token not configured")
+	}
+
+	dmChannel, err := rest.CreateDM(ctx, config.Conf.Discord.Token, c.rateLimiter, req.UserId)
+	if err != nil {
+		c.logger.Error("Failed to create DM channel for export",
+			zap.Error(err),
+			zap.String("scrambled_user_id", scrambledUserId),
+		)
+		return fmt.Errorf("failed to create DM channel: %w", err)
+	}
+
+	content := i18n.GetMessage(locale, i18n.GdprExportDmMessage)
+
+	data := rest.CreateMessageData{
+		Content: content,
+		Attachments: []request.Attachment{
+			{
+				Id:       0,
+				FileName: result.ExportFileName,
+				File: request.File{
+					ContentType: "application/zip",
+					Reader:      bytes.NewReader(result.ExportData),
+				},
+			},
+		},
+	}
+
+	_, err = rest.CreateMessage(ctx, config.Conf.Discord.Token, c.rateLimiter, dmChannel.Id, data)
+	if err != nil {
+		c.logger.Error("Failed to send export DM with attachment",
+			zap.Error(err),
+			zap.String("scrambled_user_id", scrambledUserId),
+			zap.Uint64("channel_id", dmChannel.Id),
+			zap.String("export_file", result.ExportFileName),
+		)
+		return fmt.Errorf("failed to send export DM: %w", err)
+	}
+
+	c.logger.Info("Export sent via DM",
+		zap.String("scrambled_user_id", scrambledUserId),
+		zap.String("export_file", result.ExportFileName),
+	)
 
 	return nil
 }

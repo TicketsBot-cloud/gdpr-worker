@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"os/signal"
 	"syscall"
@@ -17,6 +18,7 @@ import (
 	"github.com/TicketsBot-cloud/gdpr-worker/internal/processor"
 	"github.com/TicketsBot-cloud/gdpr-worker/internal/utils"
 	"github.com/go-redis/redis/v8"
+	"github.com/jackc/pgx/v4/pgxpool"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 
@@ -61,14 +63,37 @@ func main() {
 		return
 	}
 
-	logger.Info("Initializing archiver client")
+	logger.Info("Initialising archiver client")
 	archiver.Initialize(
 		logger.With(),
 		config.Conf.Archiver.Url,
 		config.Conf.Archiver.AesKey,
 	)
 
-	proc := processor.New(logger.With())
+	// Initialise cache database connection for user export operations
+	var cachePool *pgxpool.Pool
+	if config.Conf.CacheDatabase.Host != "" {
+		logger.Info("Connecting to cache database")
+		cacheUri := fmt.Sprintf("postgres://%s:%s@%s/%s?pool_max_conns=%d",
+			config.Conf.CacheDatabase.Username,
+			config.Conf.CacheDatabase.Password,
+			config.Conf.CacheDatabase.Host,
+			config.Conf.CacheDatabase.Database,
+			config.Conf.CacheDatabase.Threads,
+		)
+
+		var err error
+		cachePool, err = pgxpool.Connect(context.Background(), cacheUri)
+		if err != nil {
+			logger.Fatal("Failed to connect to cache database", zap.Error(err))
+			return
+		}
+		logger.Info("Connected to cache database")
+	} else {
+		logger.Warn("Cache database not configured, user export cache data will be unavailable")
+	}
+
+	proc := processor.New(logger.With(), cachePool)
 
 	callbackHandler := callback.New(
 		logger.With(),
@@ -142,12 +167,14 @@ func main() {
 				}
 
 				callbackData := callback.ResultData{
-					TranscriptsDeleted:    result.TranscriptsDeleted,
-					MessagesDeleted: result.MessagesDeleted,
-					Error:           result.Error,
-					RequestType:     req.Request.Type,
-					GuildIds:        req.Request.GuildIds,
-					TicketIds:       req.Request.TicketIds,
+					TranscriptsDeleted: result.TranscriptsDeleted,
+					MessagesDeleted:    result.MessagesDeleted,
+					Error:              result.Error,
+					RequestType:        req.Request.Type,
+					GuildIds:           req.Request.GuildIds,
+					TicketIds:          req.Request.TicketIds,
+					ExportData:         result.ExportData,
+					ExportFileName:     result.ExportFileName,
 				}
 
 				callbackCtx, callbackCancel := context.WithTimeout(context.Background(), 30*time.Second)

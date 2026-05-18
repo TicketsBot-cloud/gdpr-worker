@@ -14,4 +14,8 @@ var (
 	GdprFollowupError                MessageId = "gdpr.followup.error"
 	GdprFollowupNoData               MessageId = "gdpr.followup.no_data"
 	GdprFollowupSuccess              MessageId = "gdpr.followup.success"
+	GdprCompletedExportGuild         MessageId = "gdpr.completed.export_guild"
+	GdprCompletedExportGuildMulti    MessageId = "gdpr.completed.export_guild_multi"
+	GdprCompletedExportUser          MessageId = "gdpr.completed.export_user"
+	GdprExportDmMessage              MessageId = "gdpr.export.dm_message"
 )
