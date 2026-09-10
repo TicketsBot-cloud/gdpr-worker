@@ -4,28 +4,27 @@ go 1.25.0
 
 //replace github.com/TicketsBot-cloud/database => ../database
 
-replace github.com/TicketsBot-cloud/gdl => ../gdl
+//replace github.com/TicketsBot-cloud/gdl => ../gdl
 
 //replace github.com/TicketsBot-cloud/archiverclient => ./archiverclient
 
-replace github.com/TicketsBot-cloud/logarchiver => ../logarchiver
+//replace github.com/TicketsBot-cloud/logarchiver => ../logarchiver
 
 require (
 	github.com/TicketsBot-cloud/archiverclient v0.0.0-20251015181023-f0b66a074704
-	github.com/TicketsBot-cloud/common v0.0.0-20260210203202-54154661338e
 	github.com/TicketsBot-cloud/database v0.0.0-20260308193919-30a698fefa8b
-	github.com/TicketsBot-cloud/gdl v0.0.0-20260306134952-cccb0116fef6
-	github.com/TicketsBot-cloud/logarchiver v0.0.0-20250809082842-70aa389bcbdf
+	github.com/TicketsBot-cloud/gdl v0.0.0-20260612070331-a3947b410d3e
+	github.com/TicketsBot-cloud/logarchiver v0.0.0-20260909063657-e32e33f1289b
 	github.com/caarlos0/env/v10 v10.0.0
 	github.com/go-redis/redis/v8 v8.11.5
 	github.com/jackc/pgx/v4 v4.18.3
 	github.com/joho/godotenv v1.5.1
-	github.com/minio/minio-go/v7 v7.0.99
 	go.uber.org/zap v1.27.1
 	golang.org/x/sync v0.20.0
 )
 
 require (
+	github.com/TicketsBot-cloud/common v0.0.0-20260210203202-54154661338e // indirect
 	github.com/TicketsBot/common v0.0.0-20241117150316-ff54c97b45c1 // indirect
 	github.com/TicketsBot/ttlcache v1.6.1-0.20200405150101-acc18e37b261 // indirect
 	github.com/boltdb/bolt v1.3.1 // indirect
@@ -53,6 +52,7 @@ require (
 	github.com/klauspost/crc32 v1.3.0 // indirect
 	github.com/minio/crc64nvme v1.1.1 // indirect
 	github.com/minio/md5-simd v1.1.2 // indirect
+	github.com/minio/minio-go/v7 v7.0.99 // indirect
 	github.com/modern-go/concurrent v0.0.0-20180306012644-bacd9c7ef1dd // indirect
 	github.com/modern-go/reflect2 v1.0.2 // indirect
 	github.com/pasztorpisti/qs v0.0.0-20171216220353-8d6c33ee906c // indirect
