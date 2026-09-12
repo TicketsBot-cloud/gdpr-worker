@@ -82,7 +82,7 @@ func (p *Processor) verifyGuildOwnership(ctx context.Context, guildId, userId ui
 			zap.Uint64("guild_id", guildId),
 			zap.Error(err),
 		)
-		return fmt.Errorf("failed to verify guild ownership: unable to fetch guild information")
+		return fmt.Errorf("the bot is not in server %d, so ownership could not be verified - add it back and try again", guildId)
 	}
 
 	if guild.OwnerId != userId {
