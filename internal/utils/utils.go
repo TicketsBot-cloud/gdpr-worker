@@ -73,6 +73,10 @@ func GetRequestTypeName(requestType int) string {
 		return "AllMessages"
 	case 3:
 		return "SpecificMessages"
+	case 4:
+		return "ExportGuild"
+	case 5:
+		return "ExportUser"
 	default:
 		return fmt.Sprintf("Unknown(%d)", requestType)
 	}

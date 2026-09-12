@@ -2,11 +2,14 @@ package main
 
 import (
 	"context"
+	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
+	"github.com/TicketsBot-cloud/gdl/rest/request"
 	"github.com/TicketsBot-cloud/gdpr-worker/i18n"
 	"github.com/TicketsBot-cloud/gdpr-worker/internal/archiver"
 	"github.com/TicketsBot-cloud/gdpr-worker/internal/callback"
@@ -17,11 +20,21 @@ import (
 	"github.com/TicketsBot-cloud/gdpr-worker/internal/processor"
 	"github.com/TicketsBot-cloud/gdpr-worker/internal/utils"
 	"github.com/go-redis/redis/v8"
+	"github.com/jackc/pgx/v4/pgxpool"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 
 	_ "github.com/joho/godotenv/autoload"
 )
+
+// The proxy expects the request addressed to its own host rather than the usual CONNECT protocol.
+// Application endpoints stay on discord.com, matching how the bot worker registers the same hook.
+func proxyHook(token string, req *http.Request) {
+	if !strings.HasPrefix(req.URL.Path, "/api/v9/applications/") {
+		req.URL.Scheme = "http"
+		req.URL.Host = config.Conf.Discord.ProxyUrl
+	}
+}
 
 func main() {
 	config.Parse()
@@ -35,10 +48,16 @@ func main() {
 		return
 	}
 
+	if config.Conf.Discord.ProxyUrl != "" {
+		logger.Info("Configuring REST proxy", zap.String("url", config.Conf.Discord.ProxyUrl))
+		request.RegisterPreRequestHook(proxyHook)
+	}
+
 	logger.Info("Connecting to Redis")
 	redisClient := redis.NewClient(&redis.Options{
 		Addr:     config.Conf.Redis.Address,
 		Password: config.Conf.Redis.Password,
+		PoolSize: config.Conf.Redis.Threads,
 		DB:       0,
 	})
 
@@ -61,14 +80,36 @@ func main() {
 		return
 	}
 
-	logger.Info("Initializing archiver client")
+	logger.Info("Initialising archiver client")
 	archiver.Initialize(
 		logger.With(),
 		config.Conf.Archiver.Url,
 		config.Conf.Archiver.AesKey,
 	)
 
-	proc := processor.New(logger.With())
+	var cachePool *pgxpool.Pool
+	if config.Conf.CacheDatabase.Host != "" {
+		logger.Info("Connecting to cache database")
+
+		var err error
+		cachePool, err = database.NewPool(
+			context.Background(),
+			config.Conf.CacheDatabase.Host,
+			config.Conf.CacheDatabase.Database,
+			config.Conf.CacheDatabase.Username,
+			config.Conf.CacheDatabase.Password,
+			config.Conf.CacheDatabase.Threads,
+		)
+		if err != nil {
+			logger.Fatal("Failed to connect to cache database", zap.Error(err))
+			return
+		}
+		logger.Info("Connected to cache database")
+	} else {
+		logger.Warn("Cache database not configured, user export cache data will be unavailable")
+	}
+
+	proc := processor.New(logger.With(), cachePool)
 
 	callbackHandler := callback.New(
 		logger.With(),
@@ -95,7 +136,8 @@ func main() {
 					<-semaphore
 				}()
 
-				processCtx := context.Background()
+				processCtx, processCancel := context.WithTimeout(context.Background(), config.Conf.Export.Timeout)
+				defer processCancel()
 
 				scrambledId := utils.ScrambleUserId(req.Request.UserId)
 				requestTypeName := utils.GetRequestTypeName(int(req.Request.Type))
@@ -142,23 +184,27 @@ func main() {
 				}
 
 				callbackData := callback.ResultData{
-					TranscriptsDeleted:    result.TranscriptsDeleted,
-					MessagesDeleted: result.MessagesDeleted,
-					Error:           result.Error,
-					RequestType:     req.Request.Type,
-					GuildIds:        req.Request.GuildIds,
-					TicketIds:       req.Request.TicketIds,
+					TranscriptsDeleted: result.TranscriptsDeleted,
+					MessagesDeleted:    result.MessagesDeleted,
+					Error:              result.Error,
+					RequestType:        req.Request.Type,
+					GuildIds:           req.Request.GuildIds,
+					TicketIds:          req.Request.TicketIds,
+					ExportParts:        result.ExportParts,
+					ExportedFiles:      result.ExportedFiles,
 				}
 
-				callbackCtx, callbackCancel := context.WithTimeout(context.Background(), 30*time.Second)
+				callbackCtx, callbackCancel := context.WithTimeout(context.Background(), 10*time.Minute)
 				defer callbackCancel()
 
-				if updateErr := database.Client.GdprLogs.UpdateLogStatus(req.RequestID, "Completed"); updateErr != nil {
-					logger.Error("Failed to update GDPR log status to Completed",
-						zap.Uint64("request_id", uint64(req.RequestID)),
-						zap.String("scrambled_user_id", scrambledId),
-						zap.Error(updateErr),
-					)
+				if result.Error == nil {
+					if updateErr := database.Client.GdprLogs.UpdateLogStatus(req.RequestID, "Completed"); updateErr != nil {
+						logger.Error("Failed to update GDPR log status to Completed",
+							zap.Uint64("request_id", uint64(req.RequestID)),
+							zap.String("scrambled_user_id", scrambledId),
+							zap.Error(updateErr),
+						)
+					}
 				}
 
 				if err := callbackHandler.SendCompletion(callbackCtx, req.Request, callbackData); err != nil {
