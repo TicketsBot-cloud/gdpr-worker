@@ -12,31 +12,37 @@ import (
 	"github.com/TicketsBot-cloud/gdpr-worker/internal/archiver"
 	"github.com/TicketsBot-cloud/gdpr-worker/internal/config"
 	"github.com/TicketsBot-cloud/gdpr-worker/internal/database"
+	"github.com/TicketsBot-cloud/gdpr-worker/internal/export"
 	"github.com/TicketsBot-cloud/gdpr-worker/internal/gdprrelay"
 	"github.com/TicketsBot-cloud/gdpr-worker/internal/utils"
 	v2 "github.com/TicketsBot-cloud/logarchiver/pkg/model/v2"
+	"github.com/jackc/pgx/v4/pgxpool"
 	"go.uber.org/zap"
 )
 
-// Processor handles the execution of GDPR data deletion requests
+// Processor handles the execution of GDPR data deletion and export requests
 type Processor struct {
 	logger      *zap.Logger
 	rateLimiter *ratelimit.Ratelimiter
+	cachePool   *pgxpool.Pool
 }
 
-func New(logger *zap.Logger) *Processor {
+func New(logger *zap.Logger, cachePool *pgxpool.Pool) *Processor {
 	store := ratelimit.NewMemoryStore()
 	return &Processor{
 		logger:      logger,
 		rateLimiter: ratelimit.NewRateLimiter(store, 0),
+		cachePool:   cachePool,
 	}
 }
 
 // ProcessResult contains the outcome of processing a GDPR request
 type ProcessResult struct {
-	TranscriptsDeleted int   // Number of transcript archives deleted from archiver
-	MessagesDeleted    int   // Number of ticket messages deleted from database
-	Error              error // Error if the processing failed, nil on success
+	TranscriptsDeleted int           // Number of transcript archives deleted from archiver
+	MessagesDeleted    int           // Number of ticket messages deleted from database
+	Error              error         // Error if the processing failed, nil on success
+	ExportParts        []export.Part // Deliverable ZIP archives for export requests
+	ExportedFiles      int           // Number of files written across those archives
 }
 
 func (p *Processor) Process(ctx context.Context, request gdprrelay.GDPRRequest) ProcessResult {
@@ -49,6 +55,10 @@ func (p *Processor) Process(ctx context.Context, request gdprrelay.GDPRRequest) 
 		return p.processAllMessages(ctx, request)
 	case gdprrelay.RequestTypeSpecificMessages:
 		return p.processSpecificMessages(ctx, request)
+	case gdprrelay.RequestTypeExportGuild:
+		return p.processExportGuild(ctx, request)
+	case gdprrelay.RequestTypeExportUser:
+		return p.processExportUser(ctx, request)
 	default:
 		return ProcessResult{Error: fmt.Errorf("unknown GDPR request type: %d", request.Type)}
 	}
@@ -72,7 +82,7 @@ func (p *Processor) verifyGuildOwnership(ctx context.Context, guildId, userId ui
 			zap.Uint64("guild_id", guildId),
 			zap.Error(err),
 		)
-		return fmt.Errorf("failed to verify guild ownership: unable to fetch guild information")
+		return fmt.Errorf("the bot is not in server %d, so ownership could not be verified - add it back and try again", guildId)
 	}
 
 	if guild.OwnerId != userId {

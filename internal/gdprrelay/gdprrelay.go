@@ -20,6 +20,8 @@ const (
 	RequestTypeSpecificTranscripts                    // Delete specific transcript archives by ticket IDs
 	RequestTypeAllMessages                            // Delete all ticket messages for specified guilds
 	RequestTypeSpecificMessages                       // Delete specific ticket messages by ticket IDs
+	RequestTypeExportGuild                            // Export all transcript data for specified guilds
+	RequestTypeExportUser                             // Export all personal data for the requesting user
 )
 
 // GDPRRequest represents a user's request to delete their data under GDPR regulations
