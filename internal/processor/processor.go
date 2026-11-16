@@ -2,33 +2,50 @@ package processor
 
 import (
 	"context"
-	"encoding/json"
+	"errors"
 	"fmt"
+	"net/http"
+	"slices"
 	"strings"
 
 	"github.com/TicketsBot-cloud/archiverclient"
+	"github.com/TicketsBot-cloud/common/gdprrelay"
+	dbmodel "github.com/TicketsBot-cloud/database"
 	"github.com/TicketsBot-cloud/gdl/rest"
 	"github.com/TicketsBot-cloud/gdl/rest/ratelimit"
+	"github.com/TicketsBot-cloud/gdl/rest/request"
 	"github.com/TicketsBot-cloud/gdpr-worker/internal/archiver"
 	"github.com/TicketsBot-cloud/gdpr-worker/internal/config"
 	"github.com/TicketsBot-cloud/gdpr-worker/internal/database"
-	"github.com/TicketsBot-cloud/gdpr-worker/internal/gdprrelay"
+	"github.com/TicketsBot-cloud/gdpr-worker/internal/export"
 	"github.com/TicketsBot-cloud/gdpr-worker/internal/utils"
 	v2 "github.com/TicketsBot-cloud/logarchiver/pkg/model/v2"
+	"github.com/jackc/pgx/v4/pgxpool"
+	"github.com/minio/minio-go/v7"
 	"go.uber.org/zap"
 )
 
-// Processor handles the execution of GDPR data deletion requests
+var (
+	errTranscriptDeletionFailed = errors.New("not every transcript could be deleted, please try again later")
+	errAnonymizationFailed      = errors.New("not every message could be anonymized, please try again later")
+)
+
+// Processor handles the execution of GDPR data deletion and export requests
 type Processor struct {
 	logger      *zap.Logger
 	rateLimiter *ratelimit.Ratelimiter
+	db          export.Querier
+	cachePool   *pgxpool.Pool
+	store       *minio.Client
 }
 
-func New(logger *zap.Logger) *Processor {
-	store := ratelimit.NewMemoryStore()
+func New(logger *zap.Logger, cachePool *pgxpool.Pool, store *minio.Client) *Processor {
 	return &Processor{
 		logger:      logger,
-		rateLimiter: ratelimit.NewRateLimiter(store, 0),
+		rateLimiter: ratelimit.NewRateLimiter(ratelimit.NewMemoryStore(), 0),
+		db:          database.Pool,
+		cachePool:   cachePool,
+		store:       store,
 	}
 }
 
@@ -37,6 +54,7 @@ type ProcessResult struct {
 	TranscriptsDeleted int   // Number of transcript archives deleted from archiver
 	MessagesDeleted    int   // Number of ticket messages deleted from database
 	Error              error // Error if the processing failed, nil on success
+	ExportedFiles      int
 }
 
 func (p *Processor) Process(ctx context.Context, request gdprrelay.GDPRRequest) ProcessResult {
@@ -49,6 +67,8 @@ func (p *Processor) Process(ctx context.Context, request gdprrelay.GDPRRequest) 
 		return p.processAllMessages(ctx, request)
 	case gdprrelay.RequestTypeSpecificMessages:
 		return p.processSpecificMessages(ctx, request)
+	case gdprrelay.RequestTypeExportGuild, gdprrelay.RequestTypeExportUser:
+		return p.processExport(ctx, request)
 	default:
 		return ProcessResult{Error: fmt.Errorf("unknown GDPR request type: %d", request.Type)}
 	}
@@ -57,14 +77,6 @@ func (p *Processor) Process(ctx context.Context, request gdprrelay.GDPRRequest) 
 func (p *Processor) verifyGuildOwnership(ctx context.Context, guildId, userId uint64) error {
 	scrambledUserId := utils.ScrambleUserId(userId)
 
-	if config.Conf.Discord.Token == "" {
-		p.logger.Warn("Discord token not configured, skipping ownership verification",
-			zap.String("scrambled_user_id", scrambledUserId),
-			zap.Uint64("guild_id", guildId),
-		)
-		return nil
-	}
-
 	guild, err := rest.GetGuild(ctx, config.Conf.Discord.Token, p.rateLimiter, guildId)
 	if err != nil {
 		p.logger.Error("Failed to fetch guild for ownership verification",
@@ -72,7 +84,12 @@ func (p *Processor) verifyGuildOwnership(ctx context.Context, guildId, userId ui
 			zap.Uint64("guild_id", guildId),
 			zap.Error(err),
 		)
-		return fmt.Errorf("failed to verify guild ownership: unable to fetch guild information")
+
+		var restErr request.RestError
+		if errors.As(err, &restErr) && (restErr.StatusCode == http.StatusForbidden || restErr.StatusCode == http.StatusNotFound) {
+			return fmt.Errorf("the bot is not in server %d, so ownership could not be verified - add it back and try again", guildId)
+		}
+		return fmt.Errorf("ownership of server %d could not be verified right now, please try again later", guildId)
 	}
 
 	if guild.OwnerId != userId {
@@ -107,7 +124,7 @@ func (p *Processor) processAllTranscripts(ctx context.Context, request gdprrelay
 	}
 
 	scrambledUserId := utils.ScrambleUserId(request.UserId)
-	requestTypeName := utils.GetRequestTypeName(int(request.Type))
+	requestTypeName := gdprrelay.LogNames[request.Type]
 
 	if err := p.verifyAllGuildsOwnership(ctx, request.GuildIds, request.UserId); err != nil {
 		p.logger.Error("Guild ownership verification failed",
@@ -118,39 +135,33 @@ func (p *Processor) processAllTranscripts(ctx context.Context, request gdprrelay
 	}
 
 	transcriptsDeleted := 0
-	var lastError error
+	failed := false
 
 	for _, guildId := range request.GuildIds {
 		deleted, err := p.deleteAllTranscripts(ctx, guildId)
+		transcriptsDeleted += deleted
 		if err != nil {
-			lastError = err
+			failed = true
 			p.logger.Error("Failed to delete transcripts",
 				zap.String("scrambled_user_id", scrambledUserId),
 				zap.String("request_type", requestTypeName),
+				zap.Uint64("guild_id", guildId),
 				zap.Error(err),
 			)
-			continue
 		}
-		transcriptsDeleted += deleted
 	}
 
-	if transcriptsDeleted > 0 {
-		p.logger.Info("GDPR request completed",
-			zap.String("scrambled_user_id", scrambledUserId),
-			zap.String("request_type", requestTypeName),
-			zap.Int("transcripts_deleted", transcriptsDeleted),
-		)
+	if failed {
+		return ProcessResult{TranscriptsDeleted: transcriptsDeleted, Error: errTranscriptDeletionFailed}
 	}
 
-	result := ProcessResult{
-		TranscriptsDeleted: transcriptsDeleted,
-	}
+	p.logger.Info("GDPR request completed",
+		zap.String("scrambled_user_id", scrambledUserId),
+		zap.String("request_type", requestTypeName),
+		zap.Int("transcripts_deleted", transcriptsDeleted),
+	)
 
-	if transcriptsDeleted == 0 && lastError != nil {
-		result.Error = fmt.Errorf("failed to delete any transcripts: %w", lastError)
-	}
-
-	return result
+	return ProcessResult{TranscriptsDeleted: transcriptsDeleted}
 }
 
 func (p *Processor) processSpecificTranscripts(ctx context.Context, request gdprrelay.GDPRRequest) ProcessResult {
@@ -163,7 +174,7 @@ func (p *Processor) processSpecificTranscripts(ctx context.Context, request gdpr
 
 	guildId := request.GuildIds[0]
 	scrambledUserId := utils.ScrambleUserId(request.UserId)
-	requestTypeName := utils.GetRequestTypeName(int(request.Type))
+	requestTypeName := gdprrelay.LogNames[request.Type]
 
 	if err := p.verifyGuildOwnership(ctx, guildId, request.UserId); err != nil {
 		p.logger.Error("Guild ownership verification failed",
@@ -176,7 +187,13 @@ func (p *Processor) processSpecificTranscripts(ctx context.Context, request gdpr
 
 	transcriptsDeleted, err := p.deleteSpecificTranscripts(ctx, guildId, request.TicketIds)
 	if err != nil {
-		return ProcessResult{Error: fmt.Errorf("failed to delete specific transcripts: %w", err)}
+		p.logger.Error("Failed to delete transcripts",
+			zap.String("scrambled_user_id", scrambledUserId),
+			zap.String("request_type", requestTypeName),
+			zap.Uint64("guild_id", guildId),
+			zap.Error(err),
+		)
+		return ProcessResult{TranscriptsDeleted: transcriptsDeleted, Error: errTranscriptDeletionFailed}
 	}
 
 	p.logger.Info("GDPR request completed",
@@ -193,11 +210,16 @@ func (p *Processor) processAllMessages(ctx context.Context, request gdprrelay.GD
 	var err error
 
 	scrambledUserId := utils.ScrambleUserId(request.UserId)
-	requestTypeName := utils.GetRequestTypeName(int(request.Type))
+	requestTypeName := gdprrelay.LogNames[request.Type]
 
 	messagesDeleted, err = p.deleteUserMessagesFromGuilds(ctx, request.GuildIds, request.UserId)
 	if err != nil {
-		return ProcessResult{Error: fmt.Errorf("failed to delete all user messages: %w", err)}
+		p.logger.Error("Failed to anonymize messages",
+			zap.String("scrambled_user_id", scrambledUserId),
+			zap.String("request_type", requestTypeName),
+			zap.Error(err),
+		)
+		return ProcessResult{MessagesDeleted: messagesDeleted, Error: errAnonymizationFailed}
 	}
 
 	p.logger.Info("GDPR request completed",
@@ -221,11 +243,16 @@ func (p *Processor) processSpecificMessages(ctx context.Context, request gdprrel
 
 	guildId := request.GuildIds[0]
 	scrambledUserId := utils.ScrambleUserId(request.UserId)
-	requestTypeName := utils.GetRequestTypeName(int(request.Type))
+	requestTypeName := gdprrelay.LogNames[request.Type]
 
 	messagesDeleted, err := p.deleteUserMessagesFromTickets(ctx, guildId, request.TicketIds, request.UserId)
 	if err != nil {
-		return ProcessResult{Error: fmt.Errorf("failed to delete specific user messages: %w", err)}
+		p.logger.Error("Failed to anonymize messages",
+			zap.String("scrambled_user_id", scrambledUserId),
+			zap.String("request_type", requestTypeName),
+			zap.Error(err),
+		)
+		return ProcessResult{MessagesDeleted: messagesDeleted, Error: errAnonymizationFailed}
 	}
 
 	p.logger.Info("GDPR request completed",
@@ -241,9 +268,9 @@ func (p *Processor) processSpecificMessages(ctx context.Context, request gdprrel
 
 // Transcript deletion helpers
 func (p *Processor) deleteAllTranscripts(ctx context.Context, guildId uint64) (int, error) {
-	ticketIds, err := p.getTranscriptTicketIds(ctx, guildId, nil)
+	ticketIds, err := database.Client.Tickets.GetClosedWithTranscript(ctx, guildId)
 	if err != nil {
-		return 0, err
+		return 0, fmt.Errorf("failed to query tickets: %w", err)
 	}
 	return p.deleteTranscripts(ctx, guildId, ticketIds)
 }
@@ -253,55 +280,34 @@ func (p *Processor) deleteSpecificTranscripts(ctx context.Context, guildId uint6
 		return 0, nil
 	}
 
-	validIds, err := p.getTranscriptTicketIds(ctx, guildId, ticketIds)
+	validIds, err := database.Client.Tickets.FilterClosedWithTranscript(ctx, guildId, ticketIds)
 	if err != nil {
-		return 0, err
+		return 0, fmt.Errorf("failed to query tickets: %w", err)
 	}
 	return p.deleteTranscripts(ctx, guildId, validIds)
 }
 
-func (p *Processor) getTranscriptTicketIds(ctx context.Context, guildId uint64, filterIds []int) ([]int, error) {
-	var query string
-	var args []interface{}
-
-	if filterIds == nil {
-		query = `SELECT id FROM tickets WHERE guild_id = $1 AND has_transcript = true AND open = false`
-		args = []interface{}{guildId}
-	} else {
-		query = `SELECT id FROM tickets WHERE guild_id = $1 AND id = ANY($2) AND has_transcript = true AND open = false`
-		args = []interface{}{guildId, filterIds}
-	}
-
-	rows, err := database.Client.Tickets.Query(ctx, query, args...)
-	if err != nil {
-		return nil, fmt.Errorf("failed to query tickets: %w", err)
-	}
-	defer rows.Close()
-
-	var ticketIds []int
-	for rows.Next() {
-		var ticketId int
-		if err := rows.Scan(&ticketId); err == nil {
-			ticketIds = append(ticketIds, ticketId)
-		}
-	}
-
-	return ticketIds, nil
-}
-
 func (p *Processor) deleteTranscripts(ctx context.Context, guildId uint64, ticketIds []int) (int, error) {
 	deleted := 0
+	var lastErr error
 	for _, ticketId := range ticketIds {
-		if err := p.deleteTranscript(ctx, guildId, ticketId); err == nil {
-			deleted++
-			if err := database.Client.Tickets.SetHasTranscript(ctx, guildId, ticketId, false); err != nil {
-				p.logger.Error("Failed to update has_transcript flag after deletion",
-					zap.Uint64("guild_id", guildId),
-					zap.Int("ticket_id", ticketId),
-					zap.Error(err),
-				)
-			}
+		if err := p.deleteTranscript(ctx, guildId, ticketId); err != nil {
+			lastErr = fmt.Errorf("ticket %d: %w", ticketId, err)
+			continue
 		}
+
+		deleted++
+		if err := database.Client.Tickets.SetHasTranscript(ctx, guildId, ticketId, false); err != nil {
+			p.logger.Error("Failed to update has_transcript flag after deletion",
+				zap.Uint64("guild_id", guildId),
+				zap.Int("ticket_id", ticketId),
+				zap.Error(err),
+			)
+		}
+	}
+
+	if lastErr != nil {
+		return deleted, fmt.Errorf("%d of %d transcripts could not be deleted: %w", len(ticketIds)-deleted, len(ticketIds), lastErr)
 	}
 	return deleted, nil
 }
@@ -310,158 +316,54 @@ func (p *Processor) deleteTranscript(ctx context.Context, guildId uint64, ticket
 	if archiver.Proxy == nil {
 		return fmt.Errorf("archiver proxy not initialized")
 	}
-	return archiver.Proxy.DeleteTicket(ctx, guildId, ticketId)
+
+	if err := archiver.Proxy.DeleteTicket(ctx, guildId, ticketId); err != nil && !errors.Is(err, archiverclient.ErrNotFound) {
+		return err
+	}
+	return nil
 }
 
 // Message deletion helpers
 func (p *Processor) deleteUserMessagesFromGuilds(ctx context.Context, guildIds []uint64, userId uint64) (messagesDeleted int, err error) {
-	tickets, err := p.getUserTicketsInGuilds(ctx, userId, guildIds)
+	refs, err := database.Client.Tickets.GetUserTranscriptRefs(ctx, userId)
 	if err != nil {
-		return 0, err
+		return 0, fmt.Errorf("failed to query user tickets in guilds: %w", err)
 	}
-	return p.cleanUserMessagesInTickets(ctx, tickets, userId)
-}
-
-type ticketInfo struct {
-	ID      int
-	GuildID uint64
+	return p.cleanUserMessagesInTickets(ctx, ticketsInGuilds(refs, guildIds), userId)
 }
 
 func (p *Processor) deleteUserMessagesFromTickets(ctx context.Context, guildId uint64, ticketIds []int, userId uint64) (messagesDeleted int, err error) {
-	if len(ticketIds) == 0 {
-		return 0, nil
-	}
-
-	tickets := make([]ticketInfo, 0, len(ticketIds))
-	for _, id := range ticketIds {
-		tickets = append(tickets, ticketInfo{ID: id, GuildID: guildId})
-	}
-
-	validTickets := p.validateTicketsForMessageCleaning(ctx, tickets)
-
-	return p.cleanUserMessagesInTickets(ctx, validTickets, userId)
-}
-
-func (p *Processor) getUserTickets(ctx context.Context, userId uint64) ([]ticketInfo, error) {
-	query := `
-	SELECT DISTINCT t.id, t.guild_id
-	FROM tickets t
-	LEFT JOIN ticket_members tm ON t.guild_id = tm.guild_id AND t.id = tm.ticket_id
-	WHERE (tm.user_id = $1 OR t.user_id = $1)
-	AND t.open = false
-	AND t.has_transcript = true
-	ORDER BY t.id
-	`
-
-	rows, err := database.Client.Tickets.Query(ctx, query, userId)
+	validIds, err := database.Client.Tickets.FilterClosedWithTranscript(ctx, guildId, ticketIds)
 	if err != nil {
-		return nil, fmt.Errorf("failed to query user tickets: %w", err)
-	}
-	defer rows.Close()
-
-	var tickets []ticketInfo
-	for rows.Next() {
-		var ticket ticketInfo
-		if err := rows.Scan(&ticket.ID, &ticket.GuildID); err == nil {
-			tickets = append(tickets, ticket)
-		}
+		return 0, fmt.Errorf("failed to query tickets: %w", err)
 	}
 
-	return tickets, nil
+	tickets := make([]dbmodel.TranscriptRef, len(validIds))
+	for i, id := range validIds {
+		tickets[i] = dbmodel.TranscriptRef{GuildId: guildId, TicketId: id}
+	}
+
+	return p.cleanUserMessagesInTickets(ctx, tickets, userId)
 }
 
-func (p *Processor) getUserTicketsInGuilds(ctx context.Context, userId uint64, guildIds []uint64) ([]ticketInfo, error) {
-	query := `
-	SELECT DISTINCT t.id, t.guild_id
-	FROM tickets t
-	LEFT JOIN ticket_members tm ON t.guild_id = tm.guild_id AND t.id = tm.ticket_id
-	WHERE (tm.user_id = $1 OR t.user_id = $1)
-	AND t.guild_id = ANY($2)
-	AND t.open = false
-	AND t.has_transcript = true
-	ORDER BY t.id
-	`
-
-	rows, err := database.Client.Tickets.Query(ctx, query, userId, guildIds)
-	if err != nil {
-		return nil, fmt.Errorf("failed to query user tickets in guilds: %w", err)
-	}
-	defer rows.Close()
-
-	var tickets []ticketInfo
-	for rows.Next() {
-		var ticket ticketInfo
-		if err := rows.Scan(&ticket.ID, &ticket.GuildID); err == nil {
-			tickets = append(tickets, ticket)
-		}
-	}
-
-	return tickets, nil
+func ticketsInGuilds(refs []dbmodel.TranscriptRef, guildIds []uint64) []dbmodel.TranscriptRef {
+	return slices.DeleteFunc(refs, func(ref dbmodel.TranscriptRef) bool {
+		return !slices.Contains(guildIds, ref.GuildId)
+	})
 }
 
-func (p *Processor) validateTicketsForMessageCleaning(ctx context.Context, tickets []ticketInfo) []ticketInfo {
-	if len(tickets) == 0 {
-		return nil
-	}
-
-	// Group tickets by guild_id for efficient querying
-	ticketsByGuild := make(map[uint64][]int)
-	ticketMap := make(map[uint64]map[int]ticketInfo)
-
-	for _, ticket := range tickets {
-		ticketsByGuild[ticket.GuildID] = append(ticketsByGuild[ticket.GuildID], ticket.ID)
-		if ticketMap[ticket.GuildID] == nil {
-			ticketMap[ticket.GuildID] = make(map[int]ticketInfo)
-		}
-		ticketMap[ticket.GuildID][ticket.ID] = ticket
-	}
-
-	var validTickets []ticketInfo
-
-	// Query each guild's tickets in a single query
-	for guildId, ticketIds := range ticketsByGuild {
-		query := `SELECT id FROM tickets WHERE guild_id = $1 AND id = ANY($2) AND open = false AND has_transcript = true`
-		rows, err := database.Client.Tickets.Query(ctx, query, guildId, ticketIds)
-		if err != nil {
-			p.logger.Error("Failed to validate tickets for message cleaning",
-				zap.Uint64("guild_id", guildId),
-				zap.Error(err),
-			)
-			continue
-		}
-
-		for rows.Next() {
-			var ticketId int
-			if err := rows.Scan(&ticketId); err == nil {
-				if ticket, exists := ticketMap[guildId][ticketId]; exists {
-					validTickets = append(validTickets, ticket)
-				}
-			}
-		}
-		rows.Close()
-	}
-
-	return validTickets
-}
-
-func (p *Processor) cleanUserMessagesInTickets(ctx context.Context, tickets []ticketInfo, userId uint64) (messagesDeleted int, err error) {
+func (p *Processor) cleanUserMessagesInTickets(ctx context.Context, tickets []dbmodel.TranscriptRef, userId uint64) (messagesDeleted int, err error) {
 	var lastErr error
 	for _, ticket := range tickets {
-		count, err := p.cleanUserMessages(ctx, ticket.GuildID, ticket.ID, userId)
+		count, err := p.cleanUserMessages(ctx, ticket.GuildId, ticket.TicketId, userId)
 		if err != nil {
-			lastErr = err
+			lastErr = fmt.Errorf("ticket %d in guild %d: %w", ticket.TicketId, ticket.GuildId, err)
 			continue
 		}
-		if count > 0 {
-			messagesDeleted += count
-		}
+		messagesDeleted += count
 	}
 
-	if messagesDeleted == 0 && lastErr != nil {
-		return 0, lastErr
-	}
-
-	return messagesDeleted, nil
+	return messagesDeleted, lastErr
 }
 
 func (p *Processor) cleanUserMessages(ctx context.Context, guildId uint64, ticketId int, userId uint64) (int, error) {
@@ -479,6 +381,9 @@ func (p *Processor) cleanUserMessages(ctx context.Context, guildId uint64, ticke
 
 	transcript, err := p.getTranscript(ctx, guildId, ticketId)
 	if err != nil {
+		if archiverclient.IsNotFound(err) {
+			return 0, nil
+		}
 		return 0, err
 	}
 
@@ -487,7 +392,7 @@ func (p *Processor) cleanUserMessages(ctx context.Context, guildId uint64, ticke
 		return 0, nil
 	}
 
-	if err := p.storeTranscript(ctx, guildId, ticketId, transcript); err != nil {
+	if err := archiver.Client.StoreTranscript(ctx, guildId, ticketId, transcript); err != nil {
 		return 0, fmt.Errorf("failed to store cleaned transcript: %w", err)
 	}
 
@@ -505,9 +410,6 @@ func (p *Processor) cleanUserMessages(ctx context.Context, guildId uint64, ticke
 func (p *Processor) getTranscript(ctx context.Context, guildId uint64, ticketId int) (v2.Transcript, error) {
 	transcript, err := archiver.Client.Get(ctx, guildId, ticketId)
 	if err != nil {
-		if err == archiverclient.ErrNotFound {
-			return v2.Transcript{}, fmt.Errorf("transcript not found")
-		}
 		if strings.Contains(err.Error(), "magic number") || strings.Contains(err.Error(), "invalid input") {
 			return v2.Transcript{}, fmt.Errorf("transcript format incompatible with cleaning")
 		}
@@ -549,13 +451,4 @@ func (p *Processor) cleanMessagesInTranscript(transcript *v2.Transcript, userId 
 	}
 
 	return count
-}
-
-func (p *Processor) storeTranscript(ctx context.Context, guildId uint64, ticketId int, transcript v2.Transcript) error {
-	data, err := json.Marshal(transcript)
-	if err != nil {
-		return fmt.Errorf("failed to serialize transcript: %w", err)
-	}
-
-	return archiver.Client.ImportTranscript(ctx, guildId, ticketId, data)
 }

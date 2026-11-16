@@ -5,14 +5,15 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/TicketsBot-cloud/common/gdprrelay"
+	commonutils "github.com/TicketsBot-cloud/common/utils"
 	"github.com/TicketsBot-cloud/gdl/objects/channel/message"
 	"github.com/TicketsBot-cloud/gdl/objects/interaction/component"
 	"github.com/TicketsBot-cloud/gdl/rest"
 	"github.com/TicketsBot-cloud/gdl/rest/ratelimit"
-	"github.com/TicketsBot-cloud/gdpr-worker/internal/config"
-	"github.com/TicketsBot-cloud/gdpr-worker/internal/gdprrelay"
-	"github.com/TicketsBot-cloud/gdpr-worker/internal/utils"
 	"github.com/TicketsBot-cloud/gdpr-worker/i18n"
+	"github.com/TicketsBot-cloud/gdpr-worker/internal/config"
+	"github.com/TicketsBot-cloud/gdpr-worker/internal/utils"
 	"go.uber.org/zap"
 )
 
@@ -24,6 +25,23 @@ type ResultData struct {
 	RequestType        gdprrelay.RequestType // Type of GDPR request that was processed
 	GuildIds           []uint64              // Guild IDs affected by this request
 	TicketIds          []int                 // Ticket IDs affected by this request
+	ExportedFiles      int
+	ExportId           int64
+}
+
+func (r ResultData) isExport() bool {
+	return r.RequestType == gdprrelay.RequestTypeExportGuild || r.RequestType == gdprrelay.RequestTypeExportUser
+}
+
+func (r ResultData) NotificationStatus() string {
+	switch {
+	case r.Error != nil:
+		return gdprrelay.NotificationStatusFailed
+	case r.isExport() && r.ExportedFiles == 0:
+		return gdprrelay.NotificationStatusNoData
+	default:
+		return gdprrelay.NotificationStatusCompleted
+	}
 }
 
 type Callback struct {
@@ -52,7 +70,7 @@ func (c *Callback) SendCompletion(ctx context.Context, request gdprrelay.GDPRReq
 
 	if err := c.editOriginalMessage(ctx, request, components); err != nil {
 		if c.isTokenExpired(err) {
-			if dmErr := c.sendCompletionViaDM(ctx, request, locale, result); dmErr != nil {
+			if dmErr := c.sendCompletionViaDM(ctx, request, components); dmErr != nil {
 				c.logger.Error("Failed to send completion via DM",
 					zap.Error(dmErr),
 					zap.String("scrambled_user_id", scrambledUserId),
@@ -102,19 +120,15 @@ func (c *Callback) buildResultMessage(locale *i18n.Locale, result ResultData, gu
 	switch result.RequestType {
 	case gdprrelay.RequestTypeAllTranscripts:
 		if len(result.GuildIds) == 1 {
-			guildDisplay := utils.FormatGuildDisplay(result.GuildIds[0], guildNames)
+			guildDisplay := commonutils.FormatGuildDisplay(result.GuildIds[0], guildNames[result.GuildIds[0]])
 			content = i18n.GetMessage(locale, i18n.GdprCompletedAllTranscripts, guildDisplay, result.TranscriptsDeleted)
 		} else {
-			guildDisplays := make([]string, len(result.GuildIds))
-			for i, guildId := range result.GuildIds {
-				guildDisplays[i] = utils.FormatGuildDisplay(guildId, guildNames)
-			}
-			content = i18n.GetMessage(locale, i18n.GdprCompletedAllTranscriptsMulti, strings.Join(guildDisplays, "\n* "), result.TranscriptsDeleted)
+			content = i18n.GetMessage(locale, i18n.GdprCompletedAllTranscriptsMulti, joinGuildDisplays(result.GuildIds, guildNames), result.TranscriptsDeleted)
 		}
 
 	case gdprrelay.RequestTypeSpecificTranscripts:
 		if len(result.GuildIds) > 0 {
-			guildDisplay := utils.FormatGuildDisplay(result.GuildIds[0], guildNames)
+			guildDisplay := commonutils.FormatGuildDisplay(result.GuildIds[0], guildNames[result.GuildIds[0]])
 			content = i18n.GetMessage(locale, i18n.GdprCompletedSpecificTranscripts, guildDisplay, result.TranscriptsDeleted)
 		} else {
 			content = i18n.GetMessage(locale, i18n.GdprCompletedSpecificTranscripts, "Unknown", result.TranscriptsDeleted)
@@ -122,30 +136,52 @@ func (c *Callback) buildResultMessage(locale *i18n.Locale, result ResultData, gu
 
 	case gdprrelay.RequestTypeAllMessages:
 		if len(result.GuildIds) == 1 {
-			guildDisplay := utils.FormatGuildDisplay(result.GuildIds[0], guildNames)
+			guildDisplay := commonutils.FormatGuildDisplay(result.GuildIds[0], guildNames[result.GuildIds[0]])
 			content = i18n.GetMessage(locale, i18n.GdprCompletedAllMessages, guildDisplay, result.MessagesDeleted)
 		} else {
-			guildDisplays := make([]string, len(result.GuildIds))
-			for i, guildId := range result.GuildIds {
-				guildDisplays[i] = utils.FormatGuildDisplay(guildId, guildNames)
-			}
-			content = i18n.GetMessage(locale, i18n.GdprCompletedAllMessagesMulti, strings.Join(guildDisplays, "\n* "), result.MessagesDeleted)
+			content = i18n.GetMessage(locale, i18n.GdprCompletedAllMessagesMulti, joinGuildDisplays(result.GuildIds, guildNames), result.MessagesDeleted)
 		}
 
 	case gdprrelay.RequestTypeSpecificMessages:
 		if len(result.GuildIds) > 0 {
-			guildDisplay := utils.FormatGuildDisplay(result.GuildIds[0], guildNames)
+			guildDisplay := commonutils.FormatGuildDisplay(result.GuildIds[0], guildNames[result.GuildIds[0]])
 			content = i18n.GetMessage(locale, i18n.GdprCompletedSpecificMessages, guildDisplay, result.MessagesDeleted)
 		} else {
 			content = i18n.GetMessage(locale, i18n.GdprCompletedSpecificMessages, "Unknown", result.MessagesDeleted)
 		}
+
+	case gdprrelay.RequestTypeExportGuild:
+		if len(result.GuildIds) == 1 {
+			guildDisplay := commonutils.FormatGuildDisplay(result.GuildIds[0], guildNames[result.GuildIds[0]])
+			content = i18n.GetMessage(locale, i18n.GdprCompletedExportGuild, guildDisplay)
+		} else {
+			content = i18n.GetMessage(locale, i18n.GdprCompletedExportGuildMulti, joinGuildDisplays(result.GuildIds, guildNames))
+		}
+
+	case gdprrelay.RequestTypeExportUser:
+		content = i18n.GetMessage(locale, i18n.GdprCompletedExportUser)
 	}
 
 	if result.Error != nil {
-		content = i18n.GetMessage(locale, i18n.GdprCompletedError, result.Error.Error())
+		content += i18n.GetMessage(locale, i18n.GdprCompletedError, result.Error.Error())
+	} else if result.isExport() {
+		if result.ExportedFiles == 0 {
+			content += i18n.GetMessage(locale, i18n.GdprCompletedExportNoData)
+		} else {
+			content += i18n.GetMessage(locale, i18n.GdprCompletedExportReady)
+		}
 	}
 
 	return content
+}
+
+func joinGuildDisplays(guildIds []uint64, guildNames map[uint64]string) string {
+	displays := make([]string, len(guildIds))
+	for i, guildId := range guildIds {
+		displays[i] = commonutils.FormatGuildDisplay(guildId, guildNames[guildId])
+	}
+
+	return strings.Join(displays, "\n* ")
 }
 
 func (c *Callback) buildResultComponents(locale *i18n.Locale, result ResultData, guildNames map[uint64]string) []component.Component {
@@ -158,6 +194,15 @@ func (c *Callback) buildResultComponents(locale *i18n.Locale, result ResultData,
 		component.BuildTextDisplay(component.TextDisplay{
 			Content: c.buildResultMessage(locale, result, guildNames),
 		}),
+	}
+
+	if result.isExport() && result.Error == nil && result.ExportedFiles > 0 {
+		url := fmt.Sprintf("%s/gdpr?export_id=%d", config.Conf.DashboardUrl, result.ExportId)
+		innerComponents = append(innerComponents, component.BuildActionRow(component.BuildButton(component.Button{
+			Label: i18n.GetMessage(locale, i18n.GdprCompletedDownloadButton),
+			Style: component.ButtonStyleLink,
+			Url:   &url,
+		})))
 	}
 
 	title := i18n.GetMessage(locale, i18n.GdprCompletedTitle)
@@ -178,9 +223,14 @@ func (c *Callback) editOriginalMessage(ctx context.Context, request gdprrelay.GD
 func (c *Callback) sendEphemeralFollowup(ctx context.Context, request gdprrelay.GDPRRequest, locale *i18n.Locale, result ResultData) error {
 	var content string
 
+	nothingFound := result.TranscriptsDeleted == 0 && result.MessagesDeleted == 0
+	if result.isExport() {
+		nothingFound = result.ExportedFiles == 0
+	}
+
 	if result.Error != nil {
 		content = i18n.GetMessage(locale, i18n.GdprFollowupError, result.Error.Error())
-	} else if result.TranscriptsDeleted == 0 && result.MessagesDeleted == 0 {
+	} else if nothingFound {
 		content = i18n.GetMessage(locale, i18n.GdprFollowupNoData)
 	} else {
 		content = i18n.GetMessage(locale, i18n.GdprFollowupSuccess)
@@ -195,26 +245,11 @@ func (c *Callback) sendEphemeralFollowup(ctx context.Context, request gdprrelay.
 	return err
 }
 
-func (c *Callback) sendCompletionViaDM(ctx context.Context, request gdprrelay.GDPRRequest, locale *i18n.Locale, result ResultData) error {
-	scrambledUserId := utils.ScrambleUserId(request.UserId)
-
-	if config.Conf.Discord.Token == "" {
-		c.logger.Error("Discord token not configured, cannot send DM",
-			zap.String("scrambled_user_id", scrambledUserId),
-		)
-		return fmt.Errorf("discord token not configured")
-	}
-
+func (c *Callback) sendCompletionViaDM(ctx context.Context, request gdprrelay.GDPRRequest, components []component.Component) error {
 	dmChannel, err := rest.CreateDM(ctx, config.Conf.Discord.Token, c.rateLimiter, request.UserId)
 	if err != nil {
-		c.logger.Error("Failed to create DM channel",
-			zap.Error(err),
-			zap.String("scrambled_user_id", scrambledUserId),
-		)
 		return fmt.Errorf("failed to create DM channel: %w", err)
 	}
-
-	components := c.buildResultComponents(locale, result, request.GuildNames)
 
 	data := rest.CreateMessageData{
 		Components: components,
@@ -223,11 +258,6 @@ func (c *Callback) sendCompletionViaDM(ctx context.Context, request gdprrelay.GD
 
 	_, err = rest.CreateMessage(ctx, config.Conf.Discord.Token, c.rateLimiter, dmChannel.Id, data)
 	if err != nil {
-		c.logger.Error("Failed to send DM message",
-			zap.Error(err),
-			zap.String("scrambled_user_id", scrambledUserId),
-			zap.Uint64("channel_id", dmChannel.Id),
-		)
 		return fmt.Errorf("failed to send DM message: %w", err)
 	}
 

@@ -14,4 +14,10 @@ var (
 	GdprFollowupError                MessageId = "gdpr.followup.error"
 	GdprFollowupNoData               MessageId = "gdpr.followup.no_data"
 	GdprFollowupSuccess              MessageId = "gdpr.followup.success"
+	GdprCompletedExportGuild         MessageId = "gdpr.completed.export_guild"
+	GdprCompletedExportGuildMulti    MessageId = "gdpr.completed.export_guild_multi"
+	GdprCompletedExportUser          MessageId = "gdpr.completed.export_user"
+	GdprCompletedExportReady         MessageId = "gdpr.completed.export_ready"
+	GdprCompletedExportNoData        MessageId = "gdpr.completed.export_no_data"
+	GdprCompletedDownloadButton      MessageId = "gdpr.completed.download_button"
 )
