@@ -17,7 +17,7 @@ var (
 	GdprCompletedExportGuild         MessageId = "gdpr.completed.export_guild"
 	GdprCompletedExportGuildMulti    MessageId = "gdpr.completed.export_guild_multi"
 	GdprCompletedExportUser          MessageId = "gdpr.completed.export_user"
-	GdprExportDmMessage              MessageId = "gdpr.export.dm_message"
-	GdprExportDmMessagePart          MessageId = "gdpr.export.dm_message_part"
-	GdprErrorExportDmFailed          MessageId = "gdpr.error.export_dm_failed"
+	GdprCompletedExportReady         MessageId = "gdpr.completed.export_ready"
+	GdprCompletedExportNoData        MessageId = "gdpr.completed.export_no_data"
+	GdprCompletedDownloadButton      MessageId = "gdpr.completed.download_button"
 )

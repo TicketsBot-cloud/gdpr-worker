@@ -4,14 +4,14 @@ import (
 	"context"
 	"time"
 
+	"github.com/TicketsBot-cloud/common/gdprrelay"
 	"github.com/go-redis/redis/v8"
 	"go.uber.org/zap"
 )
 
 const (
-	HeartbeatKey      = "tickets:gdpr:worker:heartbeat" // Redis key for storing the heartbeat timestamp
-	HeartbeatInterval = 10 * time.Second                 // How often to send heartbeat updates
-	HeartbeatTTL      = 30 * time.Second                 // How long before the heartbeat expires if not refreshed
+	HeartbeatInterval = 10 * time.Second // How often to send heartbeat updates
+	HeartbeatTTL      = 30 * time.Second // How long before the heartbeat expires if not refreshed
 )
 
 func Start(ctx context.Context, redisClient *redis.Client, logger *zap.Logger) {
@@ -26,7 +26,7 @@ func Start(ctx context.Context, redisClient *redis.Client, logger *zap.Logger) {
 		select {
 		case <-ctx.Done():
 			logger.Info("Heartbeat stopped")
-			if err := redisClient.Del(context.Background(), HeartbeatKey).Err(); err != nil {
+			if err := redisClient.Del(context.Background(), gdprrelay.KeyHeartbeat).Err(); err != nil {
 				logger.Error("Failed to clear heartbeat on shutdown", zap.Error(err))
 			}
 			return
@@ -38,7 +38,7 @@ func Start(ctx context.Context, redisClient *redis.Client, logger *zap.Logger) {
 
 func sendHeartbeat(ctx context.Context, redisClient *redis.Client, logger *zap.Logger) {
 	timestamp := time.Now().Unix()
-	err := redisClient.Set(ctx, HeartbeatKey, timestamp, HeartbeatTTL).Err()
+	err := redisClient.Set(ctx, gdprrelay.KeyHeartbeat, timestamp, HeartbeatTTL).Err()
 	if err != nil {
 		logger.Error("Failed to send heartbeat", zap.Error(err))
 	} else {
@@ -48,7 +48,7 @@ func sendHeartbeat(ctx context.Context, redisClient *redis.Client, logger *zap.L
 
 // Check verifies if the GDPR worker is alive
 func Check(ctx context.Context, redisClient *redis.Client) (bool, error) {
-	val, err := redisClient.Get(ctx, HeartbeatKey).Result()
+	val, err := redisClient.Get(ctx, gdprrelay.KeyHeartbeat).Result()
 	if err == redis.Nil {
 		return false, nil
 	}

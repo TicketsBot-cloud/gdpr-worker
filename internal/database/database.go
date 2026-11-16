@@ -28,8 +28,8 @@ func Connect(logger *zap.Logger, host, dbName, username, password string, thread
 	return nil
 }
 
-// The pool size is applied to the parsed config rather than interpolated into the URI: an unset
-// thread count would render as "pool_max_conns=0", which pgx rejects, taking the worker down.
+// The pool size is applied to the parsed config rather than interpolated into the URI: a thread
+// count of 0 would render as "pool_max_conns=0", which pgx rejects, taking the worker down.
 func NewPool(ctx context.Context, host, dbName, username, password string, threads int) (*pgxpool.Pool, error) {
 	uri := fmt.Sprintf("postgres://%s:%s@%s/%s", username, password, host, dbName)
 

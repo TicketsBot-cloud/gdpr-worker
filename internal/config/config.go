@@ -12,6 +12,8 @@ type Config struct {
 	LogLevel       zapcore.Level `env:"LOG_LEVEL" envDefault:"info"`
 	MaxConcurrency int           `env:"MAX_CONCURRENCY" envDefault:"1"`
 	MaxRetries     int           `env:"MAX_RETRIES" envDefault:"3"`
+	Owner          uint64        `env:"OWNER"`
+	DashboardUrl   string        `env:"DASHBOARD_URL" envDefault:"https://dashboard.tickets.bot"`
 
 	Database struct {
 		Host     string `env:"HOST,required,notEmpty"`
@@ -28,13 +30,13 @@ type Config struct {
 	} `envPrefix:"REDIS_"`
 
 	Archiver struct {
-		Url string `env:"URL,required,notEmpty"`
+		Url    string `env:"URL,required,notEmpty"`
 		AesKey string `env:"AES_KEY,required,notEmpty"`
 	} `envPrefix:"ARCHIVER_"`
 
 	Discord struct {
 		ProxyUrl string `env:"PROXY_URL"`
-		Token string `env:"TOKEN,required,notEmpty"`
+		Token    string `env:"TOKEN,required,notEmpty"`
 	} `envPrefix:"DISCORD_"`
 
 	CacheDatabase struct {
@@ -46,13 +48,18 @@ type Config struct {
 	} `envPrefix:"CACHE_"`
 
 	Export struct {
-		MaxPartBytes int `env:"MAX_PART_BYTES" envDefault:"12582912"`
-		MaxMessageBytes int `env:"MAX_MESSAGE_BYTES" envDefault:"25165824"`
-		MaxAttachmentBytes int `env:"MAX_ATTACHMENT_BYTES" envDefault:"20971520"`
-		DmDelay     time.Duration `env:"DM_DELAY" envDefault:"3s"`
 		Timeout     time.Duration `env:"TIMEOUT" envDefault:"30m"`
 		Concurrency int           `env:"CONCURRENCY" envDefault:"15"`
 	} `envPrefix:"EXPORT_"`
+
+	ExportS3 struct {
+		Endpoint  string `env:"ENDPOINT,required,notEmpty"`
+		Region    string `env:"REGION"`
+		Bucket    string `env:"BUCKET,required,notEmpty"`
+		AccessKey string `env:"ACCESS_KEY,required,notEmpty"`
+		SecretKey string `env:"SECRET_KEY,required,notEmpty"`
+		Secure    bool   `env:"SECURE" envDefault:"true"`
+	} `envPrefix:"S3_EXPORT_"`
 }
 
 var Conf Config

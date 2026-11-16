@@ -1,40 +1,42 @@
 package processor
 
 import (
+	"archive/zip"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"strings"
-	"sync/atomic"
+	"io"
+	"slices"
 	"time"
 
 	"github.com/TicketsBot-cloud/archiverclient"
+	"github.com/TicketsBot-cloud/common/gdprrelay"
+	dbmodel "github.com/TicketsBot-cloud/database"
 	"github.com/TicketsBot-cloud/gdpr-worker/internal/archiver"
 	"github.com/TicketsBot-cloud/gdpr-worker/internal/config"
 	"github.com/TicketsBot-cloud/gdpr-worker/internal/database"
 	"github.com/TicketsBot-cloud/gdpr-worker/internal/export"
-	"github.com/TicketsBot-cloud/gdpr-worker/internal/gdprrelay"
 	"github.com/TicketsBot-cloud/gdpr-worker/internal/utils"
 	v2 "github.com/TicketsBot-cloud/logarchiver/pkg/model/v2"
+	"github.com/minio/minio-go/v7"
 	"go.uber.org/zap"
 	"golang.org/x/sync/errgroup"
 )
 
-type transcriptRef struct {
-	guildId  uint64
-	ticketId int
-}
+var errExportFailed = errors.New("the export file couldn't be created, please try again later")
 
 type transcriptEntry struct {
-	ref  transcriptRef
-	name string
+	ref  dbmodel.TranscriptRef
 	data []byte
 }
 
-type archiveFile struct {
-	name string
-	data []byte
+type categoryFile struct {
+	name    string
+	key     string
+	cat     export.Category
+	arg     uint64
+	guildId uint64
 }
 
 func (p *Processor) exportConcurrency() int {
@@ -44,25 +46,41 @@ func (p *Processor) exportConcurrency() int {
 	return 15
 }
 
-func transcriptPath(ref transcriptRef) string {
-	return fmt.Sprintf("transcripts/%d/%d.json", ref.guildId, ref.ticketId)
+func transcriptPath(kind dbmodel.GdprExportType, ref dbmodel.TranscriptRef) string {
+	if kind == dbmodel.GdprExportTypeServer {
+		return fmt.Sprintf("%d/transcripts/%d.json", ref.GuildId, ref.TicketId)
+	}
+	return fmt.Sprintf("transcripts/%d/%d.json", ref.GuildId, ref.TicketId)
 }
 
-// A part has to fit both Discord ceilings on its own, or it could never be delivered.
-func maxPartBytes() int {
-	size := config.Conf.Export.MaxPartBytes
-	for _, limit := range []int{config.Conf.Export.MaxAttachmentBytes, config.Conf.Export.MaxMessageBytes} {
-		if limit > 0 && limit < size {
-			size = limit
-		}
+func exportCategories(kind dbmodel.GdprExportType, request gdprrelay.GDPRRequest) ([]string, error) {
+	categories, ok := kind.NormaliseCategories(request.Categories)
+	if !ok {
+		return nil, fmt.Errorf("invalid export categories: %q", request.Categories)
 	}
 
-	return size
+	if len(request.TicketIds) > 0 && (!slices.Contains(categories, dbmodel.GdprExportCategoryTranscripts) || len(request.GuildIds) != 1) {
+		return nil, fmt.Errorf("specific ticket IDs need the transcripts category and exactly one server")
+	}
+
+	return categories, nil
 }
 
-func (p *Processor) processExportGuild(ctx context.Context, request gdprrelay.GDPRRequest) ProcessResult {
+func guildTranscriptIds(ctx context.Context, guildId uint64, ticketIds []int) ([]int, error) {
+	if len(ticketIds) > 0 {
+		return database.Client.Tickets.FilterClosedWithTranscript(ctx, guildId, ticketIds)
+	}
+	return database.Client.Tickets.GetClosedWithTranscript(ctx, guildId)
+}
+
+func (p *Processor) guildExportJob(ctx context.Context, request gdprrelay.GDPRRequest) (*exportJob, error) {
 	if len(request.GuildIds) == 0 {
-		return ProcessResult{Error: fmt.Errorf("no server ID provided")}
+		return nil, fmt.Errorf("no server ID provided")
+	}
+
+	categories, err := exportCategories(dbmodel.GdprExportTypeServer, request)
+	if err != nil {
+		return nil, err
 	}
 
 	scrambledUserId := utils.ScrambleUserId(request.UserId)
@@ -72,123 +90,228 @@ func (p *Processor) processExportGuild(ctx context.Context, request gdprrelay.GD
 			zap.String("scrambled_user_id", scrambledUserId),
 			zap.Error(err),
 		)
-		return ProcessResult{Error: err}
+		return nil, err
 	}
 
-	manifest := &export.Manifest{
-		Version:     export.ManifestVersion,
-		Kind:        "guild",
-		GeneratedAt: time.Now().UTC(),
-	}
-
-	var refs []transcriptRef
-	for _, guildId := range request.GuildIds {
-		found, err := p.transcriptRefsForGuild(ctx, guildId)
-		if err != nil {
-			p.logger.Error("Failed to query tickets for guild export",
-				zap.Uint64("guild_id", guildId),
-				zap.String("scrambled_user_id", scrambledUserId),
-				zap.Error(err),
-			)
-			return ProcessResult{Error: fmt.Errorf("failed to list transcripts for server %d: %w", guildId, err)}
-		}
-
-		manifest.Add(fmt.Sprintf("transcripts/%d", guildId), len(found))
-		refs = append(refs, found...)
-	}
-
-	baseName := "guild_export"
-	if len(request.GuildIds) == 1 {
-		baseName = fmt.Sprintf("guild_export_%d", request.GuildIds[0])
-	}
-
-	return p.buildTranscriptExport(ctx, exportJob{
-		refs:            refs,
-		baseName:        baseName,
-		manifest:        manifest,
+	job := &exportJob{
+		manifest:        export.NewManifest(dbmodel.GdprExportTypeServer, request.ExportId, request.UserId, request.GuildIds, categories, request.TicketIds),
 		scrambledUserId: scrambledUserId,
 		logLabel:        "guild export",
-	})
+	}
+
+	for _, guildId := range request.GuildIds {
+		for _, key := range categories {
+			if key != dbmodel.GdprExportCategoryTranscripts {
+				job.files = append(job.files, categoryFile{fmt.Sprintf("%d/%s.json", guildId, key), key, export.ServerCategories[key], guildId, guildId})
+				continue
+			}
+
+			ticketIds, err := guildTranscriptIds(ctx, guildId, request.TicketIds)
+			if err != nil {
+				p.logger.Error("Failed to query tickets for guild export",
+					zap.Uint64("guild_id", guildId),
+					zap.String("scrambled_user_id", scrambledUserId),
+					zap.Error(err),
+				)
+				return nil, errExportFailed
+			}
+
+			job.transcriptGuilds = append(job.transcriptGuilds, guildId)
+			for _, ticketId := range ticketIds {
+				job.refs = append(job.refs, dbmodel.TranscriptRef{GuildId: guildId, TicketId: ticketId})
+			}
+		}
+	}
+
+	return job, nil
 }
 
-func (p *Processor) processExportUser(ctx context.Context, request gdprrelay.GDPRRequest) ProcessResult {
+func (p *Processor) userExportJob(ctx context.Context, request gdprrelay.GDPRRequest) (*exportJob, error) {
+	categories, err := exportCategories(dbmodel.GdprExportTypeUser, request)
+	if err != nil {
+		return nil, err
+	}
+
 	scrambledUserId := utils.ScrambleUserId(request.UserId)
 
-	manifest := &export.Manifest{
-		Version:     export.ManifestVersion,
-		Kind:        "user",
-		GeneratedAt: time.Now().UTC(),
-	}
-
-	userData, err := export.GetUserData(ctx, database.Pool, request.UserId, manifest)
-	if err != nil {
-		p.logger.Error("Failed to collect user database records for export",
-			zap.String("scrambled_user_id", scrambledUserId),
-			zap.Error(err),
-		)
-		return ProcessResult{Error: fmt.Errorf("failed to retrieve database data: %w", err)}
-	}
-
-	dbJson, err := json.Marshal(userData)
-	if err != nil {
-		return ProcessResult{Error: fmt.Errorf("failed to serialise database data: %w", err)}
-	}
-
-	extras := []archiveFile{{name: "database.json", data: dbJson}}
-
-	if cacheJson := p.userCacheData(ctx, request.UserId, manifest); cacheJson != nil {
-		extras = append(extras, archiveFile{name: "cache.json", data: cacheJson})
-	}
-
-	refs, err := p.transcriptRefsForUser(ctx, request.UserId)
-	if err != nil {
-		p.logger.Error("Failed to query tickets for user export",
-			zap.String("scrambled_user_id", scrambledUserId),
-			zap.Error(err),
-		)
-		return ProcessResult{Error: fmt.Errorf("failed to query user tickets: %w", err)}
-	}
-
-	manifest.Add("transcripts", len(refs))
-
-	return p.buildTranscriptExport(ctx, exportJob{
-		refs:            refs,
-		baseName:        "user_export",
-		manifest:        manifest,
+	job := &exportJob{
+		manifest:        export.NewManifest(dbmodel.GdprExportTypeUser, request.ExportId, request.UserId, request.GuildIds, categories, request.TicketIds),
 		scrambledUserId: scrambledUserId,
 		logLabel:        "user export",
-		extras:          extras,
 		filterFor:       request.UserId,
-	})
+	}
+
+	for _, key := range categories {
+		switch key {
+		case export.CategoryDiscordData:
+			job.discordData = true
+
+		case dbmodel.GdprExportCategoryTranscripts:
+			refs, err := database.Client.Tickets.GetUserTranscriptRefs(ctx, request.UserId)
+			if err != nil {
+				p.logger.Error("Failed to query tickets for user export",
+					zap.String("scrambled_user_id", scrambledUserId),
+					zap.Error(err),
+				)
+				return nil, errExportFailed
+			}
+
+			if len(request.TicketIds) > 0 {
+				refs = slices.DeleteFunc(refs, func(ref dbmodel.TranscriptRef) bool {
+					return ref.GuildId != request.GuildIds[0] || !slices.Contains(request.TicketIds, ref.TicketId)
+				})
+			}
+
+			job.refs = refs
+			job.transcriptGuilds = []uint64{0}
+
+		default:
+			cat := export.UserCategories[key]
+			if key == "affiliate" && p.reviewsFlaggedReferrals(ctx, request.UserId) {
+				cat = export.AffiliateCategory(true)
+			}
+
+			job.files = append(job.files, categoryFile{key + ".json", key, cat, request.UserId, 0})
+		}
+	}
+
+	return job, nil
+}
+
+// Same audience as the dashboard's flagged-referrals view (/admin/affiliate/flagged): the bot owner and admin-tier bot staff.
+func (p *Processor) reviewsFlaggedReferrals(ctx context.Context, userId uint64) bool {
+	if userId == config.Conf.Owner {
+		return true
+	}
+
+	rows, err := p.db.Query(ctx, `SELECT "tier" FROM bot_staff WHERE "user_id" = $1`, userId)
+	if err != nil {
+		return false
+	}
+	defer rows.Close()
+
+	var tier string
+	return rows.Next() && rows.Scan(&tier) == nil && tier == string(dbmodel.BotStaffTierAdmin)
 }
 
 type exportJob struct {
-	refs            []transcriptRef
-	baseName        string
+	refs            []dbmodel.TranscriptRef
 	manifest        *export.Manifest
 	scrambledUserId string
 	logLabel        string
-	extras          []archiveFile
+	files           []categoryFile
+	discordData     bool
+	// Guild 0 stands for every guild at once.
+	transcriptGuilds []uint64
 	// When non-zero, each transcript is reduced to that user's own messages.
 	filterFor uint64
 }
 
+func (p *Processor) processExport(ctx context.Context, request gdprrelay.GDPRRequest) ProcessResult {
+	ctx, cancel := context.WithTimeout(ctx, config.Conf.Export.Timeout)
+	defer cancel()
+
+	if request.ExportId == 0 {
+		return ProcessResult{Error: fmt.Errorf("export request has no export ID")}
+	}
+
+	build := p.userExportJob
+	if request.Type == gdprrelay.RequestTypeExportGuild {
+		build = p.guildExportJob
+	}
+
+	job, err := build(ctx, request)
+	if err != nil {
+		return ProcessResult{Error: err}
+	}
+
+	bucket := config.Conf.ExportS3.Bucket
+	key := export.ObjectKey(job.manifest.Kind, request.ExportId)
+
+	if err := export.Upload(ctx, p.store, bucket, key, func(ctx context.Context, zw *zip.Writer) error {
+		return p.writeArchive(ctx, zw, job)
+	}); err != nil {
+		p.logger.Error("Failed to upload export",
+			zap.String("scrambled_user_id", job.scrambledUserId),
+			zap.Int64("export_id", request.ExportId),
+			zap.Error(err),
+		)
+		return ProcessResult{Error: errExportFailed}
+	}
+
+	if !slices.ContainsFunc(job.manifest.Sources, func(source export.ManifestSource) bool { return source.Records > 0 }) {
+		if err := p.store.RemoveObject(ctx, bucket, key, minio.RemoveObjectOptions{}); err != nil && minio.ToErrorResponse(err).Code != minio.NoSuchKey {
+			p.logger.Warn("Failed to remove empty export",
+				zap.String("scrambled_user_id", job.scrambledUserId),
+				zap.Int64("export_id", request.ExportId),
+				zap.Error(err),
+			)
+		}
+
+		if err := database.Client.GdprExports.SetStatus(ctx, request.ExportId, dbmodel.GdprExportStatusNoData); err != nil {
+			p.logger.Error("Failed to record empty export",
+				zap.String("scrambled_user_id", job.scrambledUserId),
+				zap.Int64("export_id", request.ExportId),
+				zap.Error(err),
+			)
+			return ProcessResult{Error: errExportFailed}
+		}
+
+		p.logger.Info("Export found no data",
+			zap.String("scrambled_user_id", job.scrambledUserId),
+			zap.String("export", job.logLabel),
+		)
+		return ProcessResult{}
+	}
+
+	if err := database.Client.GdprExports.SetReady(ctx, request.ExportId, key); err != nil {
+		p.logger.Error("Failed to mark export ready",
+			zap.String("scrambled_user_id", job.scrambledUserId),
+			zap.Int64("export_id", request.ExportId),
+			zap.Error(err),
+		)
+		return ProcessResult{Error: errExportFailed}
+	}
+
+	p.logger.Info("Export completed",
+		zap.String("scrambled_user_id", job.scrambledUserId),
+		zap.String("export", job.logLabel),
+		zap.Int64("export_id", request.ExportId),
+		zap.Int("files", job.manifest.Files.Written),
+	)
+
+	return ProcessResult{ExportedFiles: job.manifest.Files.Written}
+}
+
 // Streamed into the archive as they arrive, so peak memory tracks the concurrency limit rather
 // than the size of the whole export.
-func (p *Processor) buildTranscriptExport(ctx context.Context, job exportJob) ProcessResult {
-	builder := export.NewBuilder(maxPartBytes())
+func (p *Processor) writeArchive(ctx context.Context, zw *zip.Writer, job *exportJob) error {
+	for _, file := range job.files {
+		w, err := createEntry(zw, file.name)
+		if err == nil {
+			err = export.WriteCategory(ctx, p.db, w, job.manifest, file.key, file.cat, file.arg, file.guildId)
+		}
+		if err != nil {
+			return fmt.Errorf("failed to export %s: %w", file.name, err)
+		}
 
-	for _, extra := range job.extras {
-		if err := builder.Add(extra.name, extra.data); err != nil {
-			return ProcessResult{Error: err}
+		job.manifest.Files.Written++
+	}
+
+	if job.discordData {
+		if data := p.userCacheData(ctx, job.manifest.UserId, job.manifest); data != nil {
+			if err := writeEntry(zw, "discord_data.json", data); err != nil {
+				return err
+			}
+
+			job.manifest.Files.Written++
 		}
 	}
 
-	results := make(chan transcriptEntry, p.exportConcurrency())
+	results := make(chan transcriptEntry)
 	done := make(chan struct{})
 
 	var downloadErr error
-	var missing atomic.Int64
 
 	go func() {
 		defer close(done)
@@ -198,13 +321,9 @@ func (p *Processor) buildTranscriptExport(ctx context.Context, job exportJob) Pr
 
 		for _, ref := range job.refs {
 			g.Go(func() error {
-				entry, absent, err := p.fetchTranscript(gCtx, ref, job.filterFor)
+				entry, err := p.fetchTranscript(gCtx, ref, job.filterFor)
 				if err != nil {
 					return err
-				}
-
-				if absent {
-					missing.Add(1)
 				}
 
 				if entry == nil {
@@ -224,14 +343,28 @@ func (p *Processor) buildTranscriptExport(ctx context.Context, job exportJob) Pr
 		close(results)
 	}()
 
+	written := make(map[uint64]int)
+	missing := make(map[uint64]int)
+
 	var addErr error
 	for entry := range results {
 		if addErr != nil {
 			continue
 		}
-		if err := builder.Add(entry.name, entry.data); err != nil {
-			addErr = err
+
+		if entry.data == nil {
+			missing[entry.ref.GuildId]++
+			missing[0]++
+			continue
 		}
+
+		if err := writeEntry(zw, transcriptPath(job.manifest.Kind, entry.ref), entry.data); err != nil {
+			addErr = err
+			continue
+		}
+
+		written[entry.ref.GuildId]++
+		written[0]++
 	}
 
 	<-done
@@ -242,15 +375,24 @@ func (p *Processor) buildTranscriptExport(ctx context.Context, job exportJob) Pr
 			zap.String("export", job.logLabel),
 			zap.Error(downloadErr),
 		)
-		return ProcessResult{Error: fmt.Errorf("failed to download transcripts: %w", downloadErr)}
+		return fmt.Errorf("failed to download transcripts: %w", downloadErr)
 	}
 
 	if addErr != nil {
-		return ProcessResult{Error: addErr}
+		return addErr
 	}
 
-	if absent := int(missing.Load()); absent > 0 {
-		job.manifest.Withhold("transcripts.unavailable", fmt.Sprintf("%d recorded transcripts are no longer held by the archive store", absent))
+	job.manifest.Files.Written += written[0]
+
+	for _, guildId := range job.transcriptGuilds {
+		job.manifest.Add(dbmodel.GdprExportCategoryTranscripts, guildId, "transcripts", written[guildId])
+
+		if absent := missing[guildId]; absent > 0 {
+			job.manifest.Withhold(dbmodel.GdprExportCategoryTranscripts, guildId, "transcripts.unavailable", fmt.Sprintf("%d recorded transcripts are no longer held by the archive store", absent))
+		}
+	}
+
+	if absent := missing[0]; absent > 0 {
 		p.logger.Warn("Transcripts recorded in the database were absent from the archive store",
 			zap.String("scrambled_user_id", job.scrambledUserId),
 			zap.String("export", job.logLabel),
@@ -258,101 +400,56 @@ func (p *Processor) buildTranscriptExport(ctx context.Context, job exportJob) Pr
 		)
 	}
 
-	if oversized := builder.Oversized(); len(oversized) > 0 {
-		job.manifest.Files.Withheld = oversized
-		p.logger.Warn("Entries too large to deliver were withheld from export",
-			zap.String("scrambled_user_id", job.scrambledUserId),
-			zap.Int("count", len(oversized)),
-		)
-	}
-
-	// Reported as no-data rather than delivering an empty archive.
-	if builder.Count() == 0 {
-		p.logger.Info("Export produced no files",
-			zap.String("scrambled_user_id", job.scrambledUserId),
-			zap.String("export", job.logLabel),
-		)
-		return ProcessResult{}
-	}
-
-	job.manifest.Files.Written = builder.Count()
-
-	if manifestJson, err := json.Marshal(job.manifest); err == nil {
-		if err := builder.Add("manifest.json", manifestJson); err != nil {
-			return ProcessResult{Error: err}
-		}
-	}
-
-	parts, err := builder.Finish(job.baseName)
+	manifest, err := json.Marshal(job.manifest)
 	if err != nil {
-		return ProcessResult{Error: fmt.Errorf("failed to finalise export archive: %w", err)}
+		return err
 	}
 
-	total := 0
-	for _, part := range parts {
-		total += len(part.Data)
-	}
-
-	p.logger.Info("Export completed",
-		zap.String("scrambled_user_id", job.scrambledUserId),
-		zap.String("export", job.logLabel),
-		zap.Int("files", builder.Count()),
-		zap.Int("parts", len(parts)),
-		zap.Int("bytes", total),
-	)
-
-	return ProcessResult{
-		ExportParts:   parts,
-		ExportedFiles: builder.Count(),
-	}
+	return writeEntry(zw, "manifest.json", manifest)
 }
 
-// Returns nil for a transcript that is absent or, when filtering, holds nothing of the
-// requester's. The bool marks the absent case, which is ordinary rather than a failure: the object
-// can be purged independently of the database row.
-func (p *Processor) fetchTranscript(ctx context.Context, ref transcriptRef, filterFor uint64) (*transcriptEntry, bool, error) {
-	transcript, err := archiver.Client.Get(ctx, ref.guildId, ref.ticketId)
+func createEntry(zw *zip.Writer, name string) (io.Writer, error) {
+	return zw.CreateHeader(&zip.FileHeader{Name: name, Method: zip.Deflate, Modified: time.Now().UTC()})
+}
+
+func writeEntry(zw *zip.Writer, name string, data []byte) error {
+	w, err := createEntry(zw, name)
+	if err == nil {
+		_, err = w.Write(data)
+	}
+
+	return err
+}
+
+// An absent transcript comes back without data, which is ordinary rather than a failure: the object
+// can be purged independently of the database row. Returns nil when filtering leaves nothing of the
+// requester's.
+func (p *Processor) fetchTranscript(ctx context.Context, ref dbmodel.TranscriptRef, filterFor uint64) (*transcriptEntry, error) {
+	transcript, err := archiver.Client.Get(ctx, ref.GuildId, ref.TicketId)
 	if err != nil {
-		if isTranscriptMissing(err) {
+		if archiverclient.IsNotFound(err) {
 			p.logger.Debug("Transcript absent from archive store, skipping",
-				zap.Uint64("guild_id", ref.guildId),
-				zap.Int("ticket_id", ref.ticketId),
+				zap.Uint64("guild_id", ref.GuildId),
+				zap.Int("ticket_id", ref.TicketId),
 				zap.Error(err),
 			)
-			return nil, true, nil
+			return &transcriptEntry{ref: ref}, nil
 		}
-		return nil, false, err
+		return nil, err
 	}
 
 	if filterFor != 0 {
 		if !filterTranscriptToUser(&transcript, filterFor) {
-			return nil, false, nil
+			return nil, nil
 		}
 	}
 
 	data, err := json.Marshal(transcript)
 	if err != nil {
-		return nil, false, fmt.Errorf("failed to serialise transcript %d/%d: %w", ref.guildId, ref.ticketId, err)
+		return nil, fmt.Errorf("failed to serialise transcript %d/%d: %w", ref.GuildId, ref.TicketId, err)
 	}
 
-	return &transcriptEntry{ref: ref, name: transcriptPath(ref), data: data}, false, nil
-}
-
-// The archiver proxy only maps a 404 to ErrNotFound; an object missing from the bucket surfaces as
-// the storage backend's own wording behind another status, so the text has to be matched too.
-func isTranscriptMissing(err error) bool {
-	if errors.Is(err, archiverclient.ErrNotFound) {
-		return true
-	}
-
-	msg := strings.ToLower(err.Error())
-	for _, want := range []string{"does not exist", "no such key", "not found"} {
-		if strings.Contains(msg, want) {
-			return true
-		}
-	}
-
-	return false
+	return &transcriptEntry{ref: ref, data: data}, nil
 }
 
 // Reports whether anything of the requester's remains.
@@ -372,8 +469,7 @@ func filterTranscriptToUser(transcript *v2.Transcript, userId uint64) bool {
 	transcript.Entities.Channels = nil
 	transcript.Entities.Roles = nil
 
-	// Key by the requested id, not by the entity's own Id: once the anonymization flow has run the
-	// stored entity carries Id 0, and keying by that would leave the messages unresolvable.
+	// The requester's entity can be missing from the transcript; key it by the requested id so the messages still resolve.
 	entity := transcript.Entities.Users[userId]
 	if entity.Id == 0 {
 		entity.Id = userId
@@ -384,66 +480,10 @@ func filterTranscriptToUser(transcript *v2.Transcript, userId uint64) bool {
 	return true
 }
 
-func (p *Processor) transcriptRefsForGuild(ctx context.Context, guildId uint64) ([]transcriptRef, error) {
-	// Open tickets are excluded: the transcript only reaches the archive store on close.
-	query := `SELECT "id" FROM tickets WHERE "guild_id" = $1 AND "has_transcript" = true AND "open" = false ORDER BY "id";`
-
-	rows, err := database.Client.Tickets.Query(ctx, query, guildId)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	var refs []transcriptRef
-	for rows.Next() {
-		var ticketId int
-		if err := rows.Scan(&ticketId); err != nil {
-			return nil, err
-		}
-		refs = append(refs, transcriptRef{guildId: guildId, ticketId: ticketId})
-	}
-
-	return refs, rows.Err()
-}
-
-// The anonymization flow reads ticket_members and the previous export read participant; taking
-// either alone silently drops transcripts the user appears in.
-func (p *Processor) transcriptRefsForUser(ctx context.Context, userId uint64) ([]transcriptRef, error) {
-	query := `
-	SELECT s.guild_id, s.ticket_id
-	FROM (
-		SELECT "guild_id", "id" AS ticket_id FROM tickets WHERE "user_id" = $1
-		UNION
-		SELECT "guild_id", "ticket_id" FROM participant WHERE "user_id" = $1
-		UNION
-		SELECT "guild_id", "ticket_id" FROM ticket_members WHERE "user_id" = $1
-	) s
-	INNER JOIN tickets t ON t."guild_id" = s.guild_id AND t."id" = s.ticket_id
-	WHERE t."has_transcript" = true AND t."open" = false
-	ORDER BY s.guild_id, s.ticket_id;`
-
-	rows, err := database.Client.Tickets.Query(ctx, query, userId)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	var refs []transcriptRef
-	for rows.Next() {
-		var ref transcriptRef
-		if err := rows.Scan(&ref.guildId, &ref.ticketId); err != nil {
-			return nil, err
-		}
-		refs = append(refs, ref)
-	}
-
-	return refs, rows.Err()
-}
-
 // Returns nil when the cache database is unconfigured or unreadable; the manifest records which.
 func (p *Processor) userCacheData(ctx context.Context, userId uint64, manifest *export.Manifest) []byte {
 	if p.cachePool == nil {
-		manifest.Withhold("cache", "cache database not configured for this deployment")
+		manifest.Withhold(export.CategoryDiscordData, 0, "cache", "cache database not configured for this deployment")
 		return nil
 	}
 
@@ -457,8 +497,23 @@ func (p *Processor) userCacheData(ctx context.Context, userId uint64, manifest *
 	members := make(map[string]json.RawMessage)
 
 	rows, err := p.cachePool.Query(ctx, `SELECT "guild_id", "data" FROM members WHERE "user_id" = $1;`, userId)
+	if err == nil {
+		defer rows.Close()
+
+		for rows.Next() {
+			var guildId uint64
+			var raw json.RawMessage
+			if err := rows.Scan(&guildId, &raw); err != nil {
+				continue
+			}
+			members[fmt.Sprintf("%d", guildId)] = raw
+		}
+
+		err = rows.Err()
+	}
+
 	if err != nil {
-		manifest.Withhold("cache", "cache database could not be read")
+		manifest.Withhold(export.CategoryDiscordData, 0, "cache", "cache database could not be read")
 		p.logger.Warn("Failed to read cache member data for export",
 			zap.String("scrambled_user_id", utils.ScrambleUserId(userId)),
 			zap.Error(err),
@@ -466,26 +521,23 @@ func (p *Processor) userCacheData(ctx context.Context, userId uint64, manifest *
 		return nil
 	}
 
-	defer rows.Close()
-
-	for rows.Next() {
-		var guildId uint64
-		var raw json.RawMessage
-		if err := rows.Scan(&guildId, &raw); err != nil {
-			continue
-		}
-		members[fmt.Sprintf("%d", guildId)] = raw
-	}
-
 	data["member_data"] = members
 
 	encoded, err := json.Marshal(data)
+	if err == nil {
+		encoded, err = export.Normalise(string(encoded))
+	}
 	if err != nil {
-		manifest.Withhold("cache", "cache data could not be serialised")
+		manifest.Withhold(export.CategoryDiscordData, 0, "cache", "cache data could not be serialised")
 		return nil
 	}
 
-	manifest.Add("cache", len(members))
+	records := len(members)
+	if user != nil {
+		records++
+	}
+
+	manifest.Add(export.CategoryDiscordData, 0, "cache", records)
 
 	return encoded
 }
