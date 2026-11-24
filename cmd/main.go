@@ -148,6 +148,7 @@ func main() {
 					RequestType:     req.Request.Type,
 					GuildIds:        req.Request.GuildIds,
 					TicketIds:       req.Request.TicketIds,
+					RequestId:       req.RequestID,
 				}
 
 				callbackCtx, callbackCancel := context.WithTimeout(context.Background(), 30*time.Second)

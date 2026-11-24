@@ -24,6 +24,7 @@ type ResultData struct {
 	RequestType        gdprrelay.RequestType // Type of GDPR request that was processed
 	GuildIds           []uint64              // Guild IDs affected by this request
 	TicketIds          []int                 // Ticket IDs affected by this request
+	RequestId          int                   // Shown to the user instead of Error
 }
 
 type Callback struct {
@@ -142,10 +143,15 @@ func (c *Callback) buildResultMessage(locale *i18n.Locale, result ResultData, gu
 	}
 
 	if result.Error != nil {
-		content = i18n.GetMessage(locale, i18n.GdprCompletedError, result.Error.Error())
+		content = i18n.GetMessage(locale, i18n.GdprCompletedError, errorText(result))
 	}
 
 	return content
+}
+
+// result.Error can name the DB host and user, so users only see the request ID it's logged under.
+func errorText(result ResultData) string {
+	return fmt.Sprintf("internal error (reference %d)", result.RequestId)
 }
 
 func (c *Callback) buildResultComponents(locale *i18n.Locale, result ResultData, guildNames map[uint64]string) []component.Component {
@@ -179,7 +185,7 @@ func (c *Callback) sendEphemeralFollowup(ctx context.Context, request gdprrelay.
 	var content string
 
 	if result.Error != nil {
-		content = i18n.GetMessage(locale, i18n.GdprFollowupError, result.Error.Error())
+		content = i18n.GetMessage(locale, i18n.GdprFollowupError, errorText(result))
 	} else if result.TranscriptsDeleted == 0 && result.MessagesDeleted == 0 {
 		content = i18n.GetMessage(locale, i18n.GdprFollowupNoData)
 	} else {
